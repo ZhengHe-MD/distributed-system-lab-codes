@@ -1,5 +1,12 @@
 package mapreduce
 
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"sort"
+)
+
 func doReduce(
 	jobName string, // the name of the whole MapReduce job
 	reduceTask int, // which reduce task this is
@@ -44,4 +51,53 @@ func doReduce(
 	//
 	// Your code here (Part I).
 	//
+
+	// read one intermediate file from each map task
+	var kvs []KeyValue
+	for mapTask := 0; mapTask < nMap; mapTask++ {
+		var tmpFilename = reduceName(jobName, mapTask, reduceTask)
+		var fp, err = os.Open(tmpFilename)
+		if err != nil {
+			fmt.Printf("Reducer: open tmp file %v error\n", tmpFilename)
+		}
+		dec := json.NewDecoder(fp)
+		for {
+			var kv KeyValue
+			var err = dec.Decode(&kv)
+			if err != nil {
+				// fmt.Printf("Reducer: decode json error in tmp file %v\n", tmpFilename)
+				break
+			}
+			kvs = append(kvs, kv)
+		}
+	}
+	// sort the intermediate key/value pairs by key
+	sort.Sort(ByKey(kvs))
+
+	// call the reduceF for each key
+	var values []string
+	var reduceKvs []KeyValue
+	var prevKey string
+	for _, kv := range kvs {
+		if prevKey != "" && kv.Key != prevKey {
+			reduceKvs = append(reduceKvs, KeyValue{Key: prevKey, Value: reduceF(prevKey, values)})
+			values = []string{}
+		}
+		values = append(values, kv.Value)
+		prevKey = kv.Key
+	}
+	if prevKey != "" {
+		reduceKvs = append(reduceKvs, KeyValue{Key: prevKey, Value: reduceF(prevKey, values)})
+	}
+	// write reduceF's output to disk in json
+	var resFilename = mergeName(jobName, reduceTask)
+	var resFile, err = os.OpenFile(resFilename, os.O_CREATE|os.O_RDWR, 0666)
+	if err != nil {
+		fmt.Printf("Reducer: create result file %v error\n", resFilename)
+	}
+	var enc = json.NewEncoder(resFile)
+	for _, kv := range reduceKvs {
+		enc.Encode(kv)
+	}
+	resFile.Close()
 }

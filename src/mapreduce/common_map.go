@@ -1,7 +1,11 @@
 package mapreduce
 
 import (
+	"encoding/json"
+	"os"
+	"fmt"
 	"hash/fnv"
+	"io/ioutil"
 )
 
 func doMap(
@@ -53,6 +57,50 @@ func doMap(
 	//
 	// Your code here (Part I).
 	//
+
+	// read one of the input files (inFile)
+	var bytes, err = ioutil.ReadFile(inFile)
+
+	if err != nil {
+		fmt.Printf("Mapper: read file %v error\n", inFile)
+		// TODO: cleaning
+		return
+	}
+
+	// call mapF on that file's contents
+	var kvs = mapF(inFile, string(bytes))
+
+	// generate intermediate files
+	var tmpFiles = make([]*os.File, nReduce)
+	for rTask := 0; rTask < nReduce; rTask++ {
+		var tmpFilename = reduceName(jobName, mapTask, rTask)
+		var fp, err = os.OpenFile(tmpFilename, os.O_CREATE|os.O_RDWR, 0666)
+		if err != nil {
+			fmt.Printf("Mapper: create tmp file %v error\n", tmpFilename)
+			// TODO: cleaning
+			return
+		}
+		tmpFiles[rTask] = fp
+	}
+
+	var encs = make([]*json.Encoder, nReduce)
+	for i, tmpFile := range tmpFiles {
+		encs[i] = json.NewEncoder(tmpFile)
+	}
+
+	// partition and save each KeyValue into tmp files
+	for _, kv := range kvs {
+		var kHash = ihash(kv.Key) % nReduce
+		err := encs[kHash].Encode(&kv)
+		if err != nil {
+			fmt.Printf("Mapper: json encoder error\n")
+			return
+		}
+	}
+
+	for _, tmpFile := range tmpFiles {
+		tmpFile.Close()
+	}
 }
 
 func ihash(s string) int {
