@@ -14,3 +14,4 @@
 # swap file
 *.swp
 *~
+.idea
