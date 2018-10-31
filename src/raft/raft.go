@@ -17,13 +17,33 @@ package raft
 //   in the same server.
 //
 
-import "sync"
-import "labrpc"
+import (
+	"bytes"
+	"fmt"
+	"labgob"
+	"log"
+	"math/rand"
+	"sync"
+	"labrpc"
+	"time"
+)
 
-// import "bytes"
-// import "labgob"
+const (
+	ELECTION_TIMEOUT_LB = 150
+	ELECTION_TIMEOUT_UB = 300
 
+	REQUEST_VOTE_TIMEOUT = 20 * time.Millisecond
+	HEART_BEAT_TIMEOUT = 50 * time.Millisecond
 
+    RPC_APPEND_ENTRIES = "Raft.AppendEntries"
+    RPC_REQUEST_VOTE = "Raft.RequestVote"
+
+    NOBODY = -1
+
+	FOLLOWER = iota
+	CANDIDATE
+	LEADER
+)
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -55,16 +75,33 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	// raft p4: Figure 2
+	// Persistent State: all servers
+	currentTerm 	int			  // latest term server has seen (initialize to 0)
+	votedFor 		int			  // candidateId that received vote in current term (or null if none)
+	logs 			[]interface{} // log entries. each entry contains command. Rename to logs because of standard package log
+
+	// Volatile State: all servers
+	commitIndex 	int 		  // index of highest log entry known to be committed (initialize to 0)
+	lastApplied 	int 		  // index of highest log entry applied (initialize to 0)
+	// Volatile State: leaders
+	nextIndex 		[]int 		  // index of the next log entry to send to each peer
+	matchIndex 		[]int 		  // index of the highest log entry known to be replicated on server (initialize to 0)
+
+	// Other States
+	role 			int
+	votes 			[]bool
+	commCh			chan interface{} // use to suggest any new valid communication from candidate or leader
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
 	// Your code here (2A).
-	return term, isleader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	return rf.currentTerm, rf.role == LEADER
 }
 
 
@@ -82,6 +119,26 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	var term int
+	var votedFor int
+	var logs []interface{}
+
+	rf.mu.Lock()
+	term = rf.currentTerm
+	votedFor = rf.votedFor
+	logs = rf.logs
+	rf.mu.Unlock()
+
+	e.Encode(term)
+	e.Encode(votedFor)
+	e.Encode(logs)
+
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 
@@ -105,6 +162,20 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm, votedFor int
+	var logs []interface{}
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&logs) != nil {
+		log.Fatal("invalid persistent data format")
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.logs = logs
+	}
 }
 
 
@@ -116,6 +187,8 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Requester 	int
+	Term 		int
 }
 
 //
@@ -124,6 +197,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	VotedFor 	int
+	Term 		int
 }
 
 //
@@ -131,6 +206,20 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.PDPrintf("receive RequestVote from %d", args.Requester)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.role == FOLLOWER {
+		if rf.votedFor == NOBODY && args.Term >= rf.currentTerm {
+			rf.votedFor = args.Requester
+			rf.currentTerm = args.Term
+			rf.commCh<-struct{}{}
+		}
+	}
+
+	reply.VotedFor = rf.votedFor
+	reply.Term = rf.currentTerm
 }
 
 //
@@ -163,7 +252,35 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	ok := rf.peers[server].Call(RPC_REQUEST_VOTE, args, reply)
+	return ok
+}
+
+type AppendEntriesArgs struct {
+	Term 	int
+}
+
+type AppendEntriesReply struct {
+	Term 	int
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.role == FOLLOWER {
+		// set hasCommunication to true
+		rf.commCh <- struct {}{}
+		// update currentTerm
+		rf.currentTerm = args.Term
+		// update votedFor
+		rf.votedFor = NOBODY
+		rf.votes = make([]bool, len(rf.peers))
+	}
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call(RPC_APPEND_ENTRIES, args, reply)
 	return ok
 }
 
@@ -222,10 +339,151 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.currentTerm = 0
+	rf.votedFor = NOBODY
+	rf.logs = []interface{}{}
+
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+
+	rf.nextIndex = make([]int, len(peers))
+	rf.matchIndex = make([]int, len(peers))
+
+	// raft p5 5.2
+	// When servers start up, they begin as followers.
+	rf.role = FOLLOWER
+
+	rf.votes = make([]bool, len(rf.peers))
+	rf.commCh = make(chan interface{})
+
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	// initialization ends
+
+	// if no communication: begins a new election
+	// if receive valid RPCs from a leader or candidate, remains in follower state
+	go func() {
+		for {
+			if rf.role == LEADER {
+				go rf.sendHeartBeatMessages()
+				time.Sleep(HEART_BEAT_TIMEOUT)
+			}
+
+			if rf.role == CANDIDATE {
+				time.Sleep(HEART_BEAT_TIMEOUT)
+			}
+
+
+			if rf.role == FOLLOWER {
+				et := generateET()
+				rf.PDPrintf("new election timeout: %d", et)
+				select {
+				case <-rf.commCh:
+					rf.PDPrintf("receive valid message from candidate/leader")
+					continue
+				case <-time.After(time.Millisecond * time.Duration(et)):
+					// if it is FOLLOWER, begins a new election
+					if rf.role == FOLLOWER && rf.votedFor == NOBODY {
+						rf.beginNewElection()
+					}
+				}
+			}
+		}
+	}()
 
 	return rf
+}
+
+func (rf *Raft) beginNewElection() {
+	rf.PDPrintf("begins a new election")
+	// increase current term
+	rf.mu.Lock()
+	rf.currentTerm += 1
+	// votes for itself
+	rf.votedFor = rf.me
+	rf.votes[rf.me] = true
+	// transition to candidate state
+	rf.role = CANDIDATE
+	// issues RequestVote RPCs in parallel to each of the other servers
+	for i, _ := range rf.peers {
+		if i != rf.me {
+			go func(server int) {
+				go rf.issueRequestVote(server)
+			}(i)
+		}
+	}
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) issueRequestVote(server int) {
+	args := RequestVoteArgs{
+		Requester: rf.me,
+		Term: rf.currentTerm,
+	}
+	// retry if request failed
+	for {
+		reply := RequestVoteReply{}
+		rf.PDPrintf("sends RequestVote to %d", server)
+		ok := rf.sendRequestVote(server, &args, &reply)
+
+		if ok {
+			if rf.role == CANDIDATE && reply.VotedFor == rf.me && reply.Term == rf.currentTerm {
+				rf.PDPrintf("receive vote from %d", server)
+				rf.votes[server] = true
+				if hasMajorityVotes(rf.votes) {
+					rf.PDPrintf("becomes LEADER")
+					// gain majority votes: becomes LEADER
+					rf.votedFor = NOBODY
+					rf.votes = make([]bool, len(rf.peers))
+					rf.role = LEADER
+				}
+			}
+			break
+		}
+
+		time.Sleep(REQUEST_VOTE_TIMEOUT)
+	}
+}
+
+// HeartBeat is AppendEntries RPC that carry no log entries
+func (rf *Raft) sendHeartBeatMessages() {
+	// TODO: start sending heartbeat messages to all of the other servers
+	// to establish its authority and prevent new elections
+	rf.mu.Lock()
+	term := rf.currentTerm
+	rf.mu.Unlock()
+	for i, _ := range rf.peers {
+		if i != rf.me {
+			go func(server int) {
+				rf.PDPrintf("sends heartbeat message to %d", server)
+				args := AppendEntriesArgs{Term: term}
+				reply := AppendEntriesReply{}
+				go rf.sendAppendEntries(server, &args, &reply)
+			}(i)
+		}
+	}
+}
+
+
+func generateET() int {
+	return rand.Intn(ELECTION_TIMEOUT_LB) + (ELECTION_TIMEOUT_UB - ELECTION_TIMEOUT_LB)
+}
+
+func hasMajorityVotes(votes []bool) bool {
+	total := len(votes)
+	count := 0
+	for _, vote := range votes {
+		if vote {
+			count += 1
+		}
+	}
+	return count >= (total / 2 + 1)
+}
+
+func (rf *Raft) PDPrintf(format string, a ...interface{}) (n int, err error) {
+	head := fmt.Sprintf("[Peer %d]: ", rf.me)
+	DPrintf(head + format, a...)
+	return
 }
