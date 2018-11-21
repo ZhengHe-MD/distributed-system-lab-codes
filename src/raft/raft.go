@@ -33,6 +33,7 @@ const (
 	ELECTION_TIMEOUT_UB = 300
 
 	REQUEST_VOTE_TIMEOUT = 20 * time.Millisecond
+	APPEND_ENTRIES_TIMEOUT = 50 * time.Millisecond
 	HEART_BEAT_TIMEOUT = 50 * time.Millisecond
 
     RPC_APPEND_ENTRIES = "Raft.AppendEntries"
@@ -62,6 +63,17 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+type logEntry struct {
+	Index int
+	Term int
+	Command interface{}
+}
+
+type LeaderMsg struct {
+	Term 		int
+	LeaderId 	int
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -79,7 +91,7 @@ type Raft struct {
 	// Persistent State: all servers
 	currentTerm 	int			  // latest term server has seen (initialize to 0)
 	votedFor 		int			  // candidateId that received vote in current term (or null if none)
-	logs 			[]interface{} // log entries. each entry contains command. Rename to logs because of standard package log
+	logs 			[]logEntry    // log entries. each entry contains command. Rename to logs because of standard package log
 
 	// Volatile State: all servers
 	commitIndex 	int 		  // index of highest log entry known to be committed (initialize to 0)
@@ -91,7 +103,11 @@ type Raft struct {
 	// Other States
 	role 			int
 	votes 			[]bool
-	commCh			chan interface{} // use to suggest any new valid communication from candidate or leader
+	fCh				chan interface{}	// use to suggest any valid communication from follower
+	lCh		 		chan LeaderMsg 		// use to suggest any valid communication from leader
+	cCh 			chan interface{} 	// use to suggest any valid communication from candidate
+	aslCh 			chan interface{}    // use to suggest has become leader
+	applyCh 		chan ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -123,14 +139,10 @@ func (rf *Raft) persist() {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 
-	var term int
-	var votedFor int
-	var logs []interface{}
-
 	rf.mu.Lock()
-	term = rf.currentTerm
-	votedFor = rf.votedFor
-	logs = rf.logs
+	term := rf.currentTerm
+	votedFor := rf.votedFor
+	logs := rf.logs
 	rf.mu.Unlock()
 
 	e.Encode(term)
@@ -166,7 +178,7 @@ func (rf *Raft) readPersist(data []byte) {
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 	var currentTerm, votedFor int
-	var logs []interface{}
+	var logs []logEntry
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
 		d.Decode(&logs) != nil {
@@ -187,8 +199,11 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Requester 	int
-	Term 		int
+	Term        	int
+	CandidateID 	int
+
+	LastLogIndex 	int // index of candidate's last log entry
+	LastLogTerm 	int // term of candidate's last log entry
 }
 
 //
@@ -197,8 +212,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
-	VotedFor 	int
-	Term 		int
+	Term        int
+	VoteGranted int
 }
 
 //
@@ -206,19 +221,29 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	rf.PDPrintf("receive RequestVote from %d", args.Requester)
+	rf.PDPrintf("receive RequestVote from %d", args.CandidateID)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if rf.role == FOLLOWER {
-		if rf.votedFor == NOBODY && args.Term >= rf.currentTerm {
-			rf.votedFor = args.Requester
-			rf.currentTerm = args.Term
-			rf.commCh<-struct{}{}
+	if rf.role == FOLLOWER || rf.role == CANDIDATE {
+		ll, exists := lastLogEntry(rf.logs)
+		// in two cases, the follower should vote for the candidate
+		// 1. no last log entry exists
+		// 2. last log entry exists and the candidate's logs is at
+		//    least as up-to-date as the current follower
+		// either case, if the candidate's term is equal to the follower's,
+		// the follower should not have voted for other candidates, if the
+		// candidate's term is larger than the follower, there is no constraint
+		if !exists || (exists && (ll.Term <= args.LastLogTerm || ll.Index <= args.LastLogIndex)) {
+			if rf.votedFor == NOBODY && args.Term == rf.currentTerm || args.Term > rf.currentTerm {
+				rf.votedFor = args.CandidateID
+				rf.currentTerm = args.Term
+				rf.cCh<-struct{}{}
+			}
 		}
 	}
 
-	reply.VotedFor = rf.votedFor
+	reply.VoteGranted = rf.votedFor
 	reply.Term = rf.currentTerm
 }
 
@@ -257,25 +282,62 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 type AppendEntriesArgs struct {
-	Term 	int
+	Term 			int
+	LeaderId 		int
+	PrevLogIndex 	int 		// index of log entry immediately preceding new ones
+	PrevLogTerm 	int 		// term of prevLogIndex entry
+	Entries 		[]logEntry 	// log entries to store (empty for heartbeat; may send more than one for efficiency)
+	LeaderCommit 	int 		// Leader's commit index
+
+	HeartBeatOnly   bool 		// suggests whether it is only a heartbeat message
 }
 
 type AppendEntriesReply struct {
 	Term 	int
+	Success bool
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if rf.role == FOLLOWER {
+	if args.Term < rf.currentTerm {
+		reply.Success = false
+		reply.Term = rf.currentTerm
+	} else if args.Term == rf.currentTerm {
+		// For Heartbeats
 		// set hasCommunication to true
-		rf.commCh <- struct {}{}
-		// update currentTerm
+		rf.lCh<-LeaderMsg{Term: args.Term, LeaderId: args.LeaderId}
+		// update currentTerm. should we update it here? for agreement?
 		rf.currentTerm = args.Term
-		// update votedFor
-		rf.votedFor = NOBODY
-		rf.votes = make([]bool, len(rf.peers))
+
+		// Heartbeat only
+		if args.HeartBeatOnly {
+			return
+		}
+		// For Agreement
+		pe, ok := lastLogEntry(rf.logs)
+		if !ok || (args.PrevLogIndex == pe.Index && args.PrevLogTerm == pe.Term) {
+			rf.logs = append(rf.logs, args.Entries...)
+			ll, _ := lastLogEntry(rf.logs)
+			rf.commitIndex = ll.Index
+			rf.lastApplied = ll.Index
+			reply.Term = args.Term
+			reply.Success = true
+			rf.applyCh <- ApplyMsg{
+				CommandValid: true,
+				Command:      ll.Command,
+				CommandIndex: ll.Index,
+			}
+			rf.PDPrintf("replicate log entry from leader %v", args.LeaderId)
+		} else {
+			reply.Term = args.Term
+			reply.Success = false
+		}
+	} else {
+		// TODO: args.Term > rf.currentTerm
+		rf.PDPrintf("args.Term > rf.currentTerm, not implemented")
+		rf.lCh<-LeaderMsg{Term: args.Term, LeaderId: args.LeaderId}
 	}
 }
 
@@ -302,12 +364,101 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
-	isLeader := true
 
 	// Your code here (2B).
 
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	isLeader := rf.role == LEADER
+
+	if !isLeader {
+		return index, term, false
+	} else {
+		go rf.startAgreement(command)
+		return rf.commitIndex + 1, rf.currentTerm, true
+	}
 
 	return index, term, isLeader
+}
+
+func (rf *Raft) startAgreement(command interface{}) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// raft paper p6
+	// appends the command to its log as a new entry.
+	// each log entry stores a state machine command
+	// alone with the term number.
+	nextCommitIndex := rf.commitIndex + 1
+
+	e := logEntry{
+		Index:   nextCommitIndex,
+		Term:    rf.currentTerm,
+		Command: command,
+	}
+	rf.PDPrintf("new log entry: %v", e)
+
+	// issues AppendEntries RPCs in parallel to each
+	// of the other servers to replicate the entry.
+	// if followers crash or run slowly, or if the
+	// network packets are lost, the leader retries
+	// AppendEntries RPCs indefinitely
+	prevLogEntry, ok := lastLogEntry(rf.logs)
+	if !ok {
+		prevLogEntry.Index = rf.commitIndex
+		prevLogEntry.Term = rf.currentTerm
+	}
+
+	args := AppendEntriesArgs{
+		Term:         	rf.currentTerm,
+		LeaderId:     	rf.me,
+		PrevLogIndex: 	prevLogEntry.Index,
+		PrevLogTerm:  	prevLogEntry.Term,
+		Entries:      	[]logEntry{e},
+		LeaderCommit: 	rf.commitIndex,
+		HeartBeatOnly: 	false,
+	}
+
+	rf.logs = append(rf.logs, e)
+	rf.matchIndex[rf.me] = nextCommitIndex
+
+	for i, _ := range rf.peers {
+		if i != rf.me {
+			go func(server int) {
+				for {
+					reply := AppendEntriesReply{}
+					rf.PDPrintf("sends AppendEntries to %d for agreement", server)
+					ok := rf.sendAppendEntries(server, &args, &reply)
+					if ok {
+						if rf.role == LEADER && rf.currentTerm == reply.Term && reply.Success {
+							rf.PDPrintf("log entry replicated to %d", server)
+							rf.matchIndex[server] = nextCommitIndex
+
+							// when safely replicated, the leader applies the
+							// entry to its state machine and returns the result
+							// of that execution to the client
+							if hasSafelyReplicated(rf.matchIndex, nextCommitIndex) && rf.commitIndex < nextCommitIndex {
+								rf.PDPrintf("log entry %d safely replicated", e.Index)
+								rf.commitIndex = nextCommitIndex
+								rf.lastApplied = nextCommitIndex
+								// TODO: applies the entry to its state machine
+								// TODO: returns the result of that execution to the client
+								rf.applyCh <- ApplyMsg{
+									CommandValid: true,
+									Command:      e.Command,
+									CommandIndex: e.Index,
+								}
+							}
+						}
+						break
+					}
+
+					time.Sleep(APPEND_ENTRIES_TIMEOUT)
+				}
+			}(i)
+		}
+	}
 }
 
 //
@@ -341,7 +492,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.currentTerm = 0
 	rf.votedFor = NOBODY
-	rf.logs = []interface{}{}
+	rf.logs = []logEntry{}
 
 	rf.commitIndex = 0
 	rf.lastApplied = 0
@@ -354,7 +505,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.role = FOLLOWER
 
 	rf.votes = make([]bool, len(rf.peers))
-	rf.commCh = make(chan interface{})
+	rf.fCh = make(chan interface{})
+	rf.lCh = make(chan LeaderMsg)
+	rf.cCh = make(chan interface{})
+	rf.aslCh = make(chan interface{})
+	rf.applyCh = applyCh
 
 
 	// initialize from state persisted before a crash
@@ -366,29 +521,70 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// if receive valid RPCs from a leader or candidate, remains in follower state
 	go func() {
 		for {
-			if rf.role == LEADER {
+			et := generateET()
+			switch rf.role {
+			case LEADER: {
 				go rf.sendHeartBeatMessages()
-				time.Sleep(HEART_BEAT_TIMEOUT)
+				select {
+				case <-rf.fCh: {
+					time.Sleep(HEART_BEAT_TIMEOUT)
+					continue
+				}
+				case leaderMsg := <-rf.lCh: {
+					rf.role = FOLLOWER
+					rf.currentTerm = leaderMsg.Term
+					continue
+				}
+				case <-time.After(time.Millisecond * time.Duration(et)): {
+					rf.PDPrintf("election timeout as a leader and begins a new election")
+					rf.beginNewElection()
+				}
+				}
 			}
-
-			if rf.role == CANDIDATE {
-				time.Sleep(HEART_BEAT_TIMEOUT)
+			case CANDIDATE: {
+				select {
+				case leaderMsg := <-rf.lCh: {
+					rf.PDPrintf("receive valid message from leader")
+					// a candidate may receive an AppendEntries RPC from another
+					// server claiming to be leader. If the leader's term is at least
+					// as large as the candidate's current term, then the candidate
+					// recognizes the leader as legitimate and returns to follower state
+					//
+					// NOTE:
+					// only when leaderMsg.Term >= rf.currentTerm, will the message
+					// be sent on rf.lCh, so there is no need to check here
+					rf.mu.Lock()
+					rf.role = FOLLOWER
+					rf.currentTerm = leaderMsg.Term
+					rf.votedFor = leaderMsg.LeaderId
+					rf.mu.Unlock()
+				}
+				case <-rf.cCh:
+					rf.PDPrintf("receive valid message from candidate, but should not")
+				case <-rf.aslCh:
+					continue
+				case <-time.After(time.Millisecond * time.Duration(et)):
+					rf.PDPrintf("election timeout as a candidate and begins a new election")
+					rf.beginNewElection()
+				}
 			}
-
-
-			if rf.role == FOLLOWER {
-				et := generateET()
+			case FOLLOWER: {
 				rf.PDPrintf("new election timeout: %d", et)
 				select {
-				case <-rf.commCh:
-					rf.PDPrintf("receive valid message from candidate/leader")
+				case <-rf.cCh:
+					rf.PDPrintf("receive valid message from candidate")
+					continue
+				case <-rf.lCh:
+					rf.PDPrintf("receive valid message from leader")
 					continue
 				case <-time.After(time.Millisecond * time.Duration(et)):
 					// if it is FOLLOWER, begins a new election
-					if rf.role == FOLLOWER && rf.votedFor == NOBODY {
+					if rf.role == FOLLOWER {
+						rf.PDPrintf("begins a new election")
 						rf.beginNewElection()
 					}
 				}
+			}
 			}
 		}
 	}()
@@ -397,9 +593,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 
 func (rf *Raft) beginNewElection() {
-	rf.PDPrintf("begins a new election")
 	// increase current term
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	rf.currentTerm += 1
 	// votes for itself
 	rf.votedFor = rf.me
@@ -409,18 +605,27 @@ func (rf *Raft) beginNewElection() {
 	// issues RequestVote RPCs in parallel to each of the other servers
 	for i, _ := range rf.peers {
 		if i != rf.me {
-			go func(server int) {
+			func(server int) {
 				go rf.issueRequestVote(server)
 			}(i)
 		}
 	}
-	rf.mu.Unlock()
 }
 
 func (rf *Raft) issueRequestVote(server int) {
+	// Raft uses the voting process to prevent a candidate from winning an election
+	// unless its log contains all committed entries. So RequestVoteArgs should take
+	// information about the candidate's logs
+	ll, exists := lastLogEntry(rf.logs)
+
 	args := RequestVoteArgs{
-		Requester: rf.me,
-		Term: rf.currentTerm,
+		Term:         rf.currentTerm,
+		CandidateID:  rf.me,
+	}
+
+	if exists {
+		args.LastLogIndex = ll.Index
+		args.LastLogTerm = ll.Term
 	}
 	// retry if request failed
 	for {
@@ -429,7 +634,8 @@ func (rf *Raft) issueRequestVote(server int) {
 		ok := rf.sendRequestVote(server, &args, &reply)
 
 		if ok {
-			if rf.role == CANDIDATE && reply.VotedFor == rf.me && reply.Term == rf.currentTerm {
+			rf.mu.Lock()
+			if rf.role == CANDIDATE && reply.Term == rf.currentTerm && reply.VoteGranted == rf.me {
 				rf.PDPrintf("receive vote from %d", server)
 				rf.votes[server] = true
 				if hasMajorityVotes(rf.votes) {
@@ -438,8 +644,10 @@ func (rf *Raft) issueRequestVote(server int) {
 					rf.votedFor = NOBODY
 					rf.votes = make([]bool, len(rf.peers))
 					rf.role = LEADER
+					rf.aslCh<-struct{}{}
 				}
 			}
+			rf.mu.Unlock()
 			break
 		}
 
@@ -449,20 +657,28 @@ func (rf *Raft) issueRequestVote(server int) {
 
 // HeartBeat is AppendEntries RPC that carry no log entries
 func (rf *Raft) sendHeartBeatMessages() {
-	// TODO: start sending heartbeat messages to all of the other servers
+	// start sending heartbeat messages to all of the other servers
 	// to establish its authority and prevent new elections
 	rf.mu.Lock()
 	term := rf.currentTerm
 	rf.mu.Unlock()
+
+	args := AppendEntriesArgs{Term: term, LeaderId: rf.me, HeartBeatOnly: true}
 	for i, _ := range rf.peers {
 		if i != rf.me {
-			go func(server int) {
+			func(server int) {
 				rf.PDPrintf("sends heartbeat message to %d", server)
-				args := AppendEntriesArgs{Term: term}
 				reply := AppendEntriesReply{}
-				go rf.sendAppendEntries(server, &args, &reply)
+				go rf.sendHeartBeatMessage(server, &args, &reply)
 			}(i)
 		}
+	}
+}
+
+func (rf *Raft) sendHeartBeatMessage(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	ok := rf.sendAppendEntries(server, args, reply)
+	if ok {
+		rf.fCh<-struct{}{}
 	}
 }
 
@@ -480,6 +696,26 @@ func hasMajorityVotes(votes []bool) bool {
 		}
 	}
 	return count >= (total / 2 + 1)
+}
+
+func hasSafelyReplicated(matchIndex []int, targetIndex int) bool {
+	total := len(matchIndex)
+	count := 0
+	for _, index := range matchIndex {
+		if index == targetIndex {
+			count += 1
+		}
+	}
+	return count >= (total / 2 + 1)
+}
+
+func lastLogEntry(s []logEntry) (logEntry, bool) {
+	if len(s) == 0 {
+		var nilLogEntry logEntry
+		return nilLogEntry, false
+	} else {
+		return s[len(s)-1], true
+	}
 }
 
 func (rf *Raft) PDPrintf(format string, a ...interface{}) (n int, err error) {
