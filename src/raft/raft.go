@@ -302,74 +302,40 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if args.Term < rf.currentTerm {
+	ll, exists := lastLogEntry(rf.logs)
+
+	if exists && ll.Index > args.PrevLogIndex {
+		// from invalid leader
 		reply.Success = false
 		reply.Term = rf.currentTerm
+		return
+	} else {
+		reply.Term = args.Term
+		reply.Success = true
+
+		// from valid leader
+		rf.lCh <- LeaderMsg{Term: args.Term, LeaderId: args.LeaderId}
 
 		if args.HeartBeatOnly {
 			return
 		}
 
-		ll, exists := lastLogEntry(rf.logs)
-		if exists {
-			// means though current raft server has higher term, but its logs fall
-			// behind another leader server
-			if ll.Index < args.PrevLogIndex {
-				rf.lCh<-LeaderMsg{Term: args.Term, LeaderId: args.LeaderId}
+		// TODO: apply logs from last commit
+		rf.logs = append(rf.logs, args.Entries...)
 
-				rf.logs = append(rf.logs, args.Entries...)
-				lll, _ := lastLogEntry(rf.logs)
-				rf.commitIndex = lll.Index
+		lll, _ := lastLogEntry(rf.logs)
+		rf.commitIndex = lll.Index
 
-				for _, e := range args.Entries {
-					rf.applyCh <- ApplyMsg{
-						CommandValid: true,
-						Command:      e.Command,
-						CommandIndex: e.Index,
-					}
-					rf.lastApplied = e.Index
-				}
-
-				reply.Term = args.Term
-				reply.Success = true
-				rf.PDPrintf("found logs fall behind other servers, add and apply those logs")
-			}
-		}
-
-	} else if args.Term == rf.currentTerm {
-		// For Heartbeats
-		// set hasCommunication to true
-		rf.lCh<-LeaderMsg{Term: args.Term, LeaderId: args.LeaderId}
-		// update currentTerm. should we update it here? for agreement?
-		rf.currentTerm = args.Term
-
-		// Heartbeat only
-		if args.HeartBeatOnly {
-			return
-		}
-		// For Agreement
-		pe, ok := lastLogEntry(rf.logs)
-		if !ok || args.PrevLogIndex == pe.Index {
-			rf.logs = append(rf.logs, args.Entries...)
-			ll, _ := lastLogEntry(rf.logs)
-			rf.commitIndex = ll.Index
-			rf.lastApplied = ll.Index
-			reply.Term = args.Term
-			reply.Success = true
+		for _, e := range args.Entries {
 			rf.applyCh <- ApplyMsg{
 				CommandValid: true,
-				Command:      ll.Command,
-				CommandIndex: ll.Index,
+				Command:      e.Command,
+				CommandIndex: e.Index,
 			}
-			rf.PDPrintf("replicate log entry from leader %v", args.LeaderId)
-		} else {
-			reply.Term = args.Term
-			reply.Success = false
+			rf.lastApplied = e.Index
 		}
-	} else {
-		// TODO: args.Term > rf.currentTerm
-		rf.PDPrintf("args.Term > rf.currentTerm, not implemented")
-		rf.lCh<-LeaderMsg{Term: args.Term, LeaderId: args.LeaderId}
+
+		rf.PDPrintf("replicate log entry from leader %v", args.LeaderId)
 	}
 }
 
@@ -437,14 +403,13 @@ func (rf *Raft) startAgreement(command interface{}) {
 	// if followers crash or run slowly, or if the
 	// network packets are lost, the leader retries
 	// AppendEntries RPCs indefinitely
-	prevLogEntry, ok := lastLogEntry(rf.logs)
+	ll, ok := lastLogEntry(rf.logs)
 	if !ok {
-		prevLogEntry.Index = rf.commitIndex
-		prevLogEntry.Term = rf.currentTerm
+		ll.Index = rf.commitIndex
+		ll.Term = rf.currentTerm
 	}
 
 	rf.logs = append(rf.logs, e)
-	rf.commitIndex = nextCommitIndex
 	rf.matchIndex[rf.me] = nextCommitIndex
 
 	for i, _ := range rf.peers {
@@ -452,13 +417,13 @@ func (rf *Raft) startAgreement(command interface{}) {
 			go func(server int) {
 				// different peers can receive different entries
 				args := AppendEntriesArgs{
-					Term:         	rf.currentTerm,
-					LeaderId:     	rf.me,
-					PrevLogIndex: 	prevLogEntry.Index,
-					PrevLogTerm:  	prevLogEntry.Term,
-					Entries:      	rf.logs[rf.nextIndex[server]-1:],
-					LeaderCommit: 	rf.commitIndex,
-					HeartBeatOnly: 	false,
+					Term:          rf.currentTerm,
+					LeaderId:      rf.me,
+					PrevLogIndex:  ll.Index,
+					PrevLogTerm:   ll.Term,
+					Entries:       rf.logs[rf.nextIndex[server]-1:],
+					LeaderCommit:  rf.commitIndex,
+					HeartBeatOnly: false,
 				}
 
 				for {
@@ -474,6 +439,7 @@ func (rf *Raft) startAgreement(command interface{}) {
 							// of that execution to the client
 							if hasSafelyReplicated(rf.matchIndex, nextCommitIndex) && rf.lastApplied < e.Index {
 								rf.PDPrintf("log entry %d safely replicated", e.Index)
+								rf.commitIndex = e.Index
 								rf.matchIndex[server] = e.Index
 								rf.nextIndex[server] = e.Index + 1
 								// TODO: applies the entry to its state machine
