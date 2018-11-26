@@ -389,7 +389,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return index, term, false
 	} else {
 		go rf.startAgreement(command)
-		return rf.commitIndex + 1, rf.currentTerm, true
+		return rf.commitIndex+1, rf.currentTerm, true
 	}
 
 	return index, term, isLeader
@@ -403,9 +403,10 @@ func (rf *Raft) startAgreement(command interface{}) {
 	// appends the command to its log as a new entry.
 	// each log entry stores a state machine command
 	// alone with the term number.
+	ll := rf.lastLogEntry()
 
 	e := logEntry{
-		Index:   rf.commitIndex + 1,
+		Index:   ll.Index+1,
 		Term:    rf.currentTerm,
 		Command: command,
 	}
@@ -532,7 +533,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// log[lastApplied] to state machine
 	go func() {
 		for {
-			rf.PDPrintf("rf.logs %v, rf.term %v, rf.nextIndex %d", rf.logs, rf.currentTerm, rf.nextIndex)
+			rf.PDPrintf("rf.logs %v, rf.term %v, rf.nextIndex %d, rf.commitIndex %d, rf.lastApplied %d",
+				rf.logs, rf.currentTerm, rf.nextIndex, rf.commitIndex, rf.lastApplied)
 			if rf.commitIndex > rf.lastApplied {
 				le := rf.logs[rf.lastApplied]
 				rf.applyCh<-ApplyMsg{
@@ -715,7 +717,7 @@ func (rf *Raft) sendAppendEntriesMessages() {
 							rf.matchIndex[server] = ni-1
 
 							if hasSafelyReplicated(rf.matchIndex, ni-1) && rf.nextIndex[rf.me] < ni {
-								rf.PDPrintf("entries %s safely replicated", entries)
+								rf.PDPrintf("entries %v safely replicated", entries)
 								rf.commitIndex = ni-1
 								rf.nextIndex[rf.me] = ni
 							}
@@ -724,55 +726,6 @@ func (rf *Raft) sendAppendEntriesMessages() {
 						break
 					}
 					time.Sleep(APPEND_ENTRIES_TIMEOUT)
-				}
-			}(i)
-		}
-	}
-}
-
-// HeartBeat is AppendEntries RPC that carry no log entries
-func (rf *Raft) sendHeartBeatMessages() {
-	// start sending heartbeat messages to all of the other servers
-	// to establish its authority and prevent new elections
-	for i, _ := range rf.peers {
-		if i != rf.me {
-			go func(server int) {
-				for {
-					rf.mu.Lock()
-
-					ll := rf.prevLogEntry(server)
-					entries := rf.nextLogEntries(server)
-					successNextIndex := rf.nextIndex[server] + len(entries)
-					args := AppendEntriesArgs{
-						Term: 			rf.currentTerm,
-						LeaderId: 		rf.me,
-						PrevLogIndex: 	ll.Index,
-						PrevLogTerm: 	ll.Term,
-						Entries: 		entries,
-						LeaderCommit: 	rf.commitIndex,
-					}
-
-					rf.mu.Unlock()
-					rf.PDPrintf("sends heartbeat message to %d, with args %v, with nextIndex %d", server, args, rf.nextIndex[server])
-					reply := AppendEntriesReply{}
-					ok := rf.sendAppendEntries(server, &args, &reply)
-					if ok {
-						if !reply.Success {
-							rf.mu.Lock()
-							passed := rf.checkTerm(reply.Term)
-							if !passed {
-								rf.mu.Unlock()
-								break
-							}
-							rf.nextIndex[server] -= 1
-							rf.mu.Unlock()
-							continue
-						}
-						rf.nextIndex[server] = min(successNextIndex, rf.nextIndex[rf.me])
-						rf.fCh<-struct{}{}
-					} else {
-						break
-					}
 				}
 			}(i)
 		}
