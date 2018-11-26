@@ -333,8 +333,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		prevIndex = -1
 	}
 
-	rf.PDPrintf("receive append entries, with entries %v, prevIndex %d", args.Entries, prevIndex)
-
 	// 3. if an existing entry conflicts with a new one(same index
 	// but different terms), delete the existing entry and all that
 	// follow it
@@ -419,69 +417,8 @@ func (rf *Raft) startAgreement(command interface{}) {
 	// network packets are lost, the leader retries
 	// AppendEntries RPCs indefinitely
 	rf.logs = append(rf.logs, e)
-	rf.matchIndex[rf.me] = e.Index
-
-	for i, _ := range rf.peers {
-		if i != rf.me {
-			go func(server int) {
-				for {
-					// different peers can receive different entries
-					rf.mu.Lock()
-
-					ll := rf.prevLogEntry(server)
-					successNextIndex := rf.nextIndex[server] + 1
-					args := AppendEntriesArgs{
-						Term:          rf.currentTerm,
-						LeaderId:      rf.me,
-						PrevLogIndex:  ll.Index,
-						PrevLogTerm:   ll.Term,
-						Entries:       rf.nextLogEntries(server),
-						LeaderCommit:  rf.commitIndex,
-					}
-
-					rf.mu.Unlock()
-
-					reply := AppendEntriesReply{}
-					rf.PDPrintf("sends AppendEntries to %d for agreement with log entries %v", server, args.Entries)
-					ok := rf.sendAppendEntries(server, &args, &reply)
-					if ok {
-						if !reply.Success {
-							rf.mu.Lock()
-							passed := rf.checkTerm(reply.Term)
-							if !passed {
-								rf.mu.Unlock()
-								break
-							} else {
-								rf.nextIndex[server] -= 1
-							}
-							rf.mu.Unlock()
-							continue
-						}
-
-						rf.mu.Lock()
-						if rf.role == LEADER && rf.currentTerm == reply.Term {
-							rf.PDPrintf("log entry replicated to %d", server)
-							// when safely replicated, the leader applies the
-							// entry to its state machine and returns the result
-							// of that execution to the client
-							rf.matchIndex[server] = e.Index
-							rf.nextIndex[server] = min(successNextIndex, rf.nextIndex[rf.me])
-
-							if hasSafelyReplicated(rf.matchIndex, rf.commitIndex+1) && rf.commitIndex < e.Index {
-								rf.PDPrintf("log entry %d safely replicated", e.Index)
-								rf.commitIndex = e.Index
-								rf.nextIndex[rf.me] = min(e.Index + 1, successNextIndex)
-							}
-						}
-						rf.mu.Unlock()
-						break
-					}
-
-					time.Sleep(APPEND_ENTRIES_TIMEOUT)
-				}
-			}(i)
-		}
-	}
+	rf.matchIndex[rf.me] = rf.commitIndex + 1
+	rf.sendAppendEntriesMessages()
 }
 
 //
@@ -524,7 +461,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			et := generateET()
 			switch rf.role {
 			case LEADER: {
-				go rf.sendHeartBeatMessages()
+				//go rf.sendHeartBeatMessages()
+				// send heartbeat messages
+				go rf.sendAppendEntriesMessages()
 				select {
 				case <-rf.fCh: {
 					time.Sleep(HEART_BEAT_TIMEOUT)
@@ -729,6 +668,68 @@ func (rf *Raft) issueRequestVote(server int) {
 	}
 }
 
+func (rf *Raft) sendAppendEntriesMessages() {
+	for i, _ := range rf.peers {
+		if i != rf.me {
+			go func(server int) {
+				for {
+					// different peers can receive different entries
+					rf.mu.Lock()
+
+					ll := rf.prevLogEntry(server)
+					entries := rf.nextLogEntries(server)
+					ni := rf.nextIndex[server] + len(entries)
+					args := AppendEntriesArgs{
+						Term:         rf.currentTerm,
+						LeaderId:     rf.me,
+						PrevLogIndex: ll.Index,
+						PrevLogTerm:  ll.Term,
+						Entries:      entries,
+						LeaderCommit: rf.commitIndex,
+					}
+
+					rf.mu.Unlock()
+
+					reply := AppendEntriesReply{}
+					rf.PDPrintf("sends AppendEntries to %d, with entries %v", server, entries)
+					ok := rf.sendAppendEntries(server, &args, &reply)
+					if ok {
+						if !reply.Success {
+							rf.mu.Lock()
+							passed := rf.checkTerm(reply.Term)
+							if !passed {
+								rf.mu.Unlock()
+								break
+							}
+							rf.nextIndex[server] -= 1
+							rf.mu.Unlock()
+							continue
+						}
+
+						if rf.role == LEADER && rf.currentTerm == reply.Term {
+							rf.PDPrintf("entries %v replicated to %d", entries, server)
+							// when safely replicated, the leader applies the
+							// entry to its state machine and returns the result
+							// of that execution to the client
+							rf.nextIndex[server] = ni
+							rf.matchIndex[server] = ni-1
+
+							if hasSafelyReplicated(rf.matchIndex, ni-1) && rf.nextIndex[rf.me] < ni {
+								rf.PDPrintf("entries %s safely replicated", entries)
+								rf.commitIndex = ni-1
+								rf.nextIndex[rf.me] = ni
+							}
+						}
+						rf.fCh<- struct{}{}
+						break
+					}
+					time.Sleep(APPEND_ENTRIES_TIMEOUT)
+				}
+			}(i)
+		}
+	}
+}
+
 // HeartBeat is AppendEntries RPC that carry no log entries
 func (rf *Raft) sendHeartBeatMessages() {
 	// start sending heartbeat messages to all of the other servers
@@ -754,7 +755,7 @@ func (rf *Raft) sendHeartBeatMessages() {
 					rf.mu.Unlock()
 					rf.PDPrintf("sends heartbeat message to %d, with args %v, with nextIndex %d", server, args, rf.nextIndex[server])
 					reply := AppendEntriesReply{}
-					ok := rf.sendHeartBeatMessage(server, &args, &reply)
+					ok := rf.sendAppendEntries(server, &args, &reply)
 					if ok {
 						if !reply.Success {
 							rf.mu.Lock()
@@ -762,17 +763,13 @@ func (rf *Raft) sendHeartBeatMessages() {
 							if !passed {
 								rf.mu.Unlock()
 								break
-							} else {
-								rf.nextIndex[server] -= 1
 							}
+							rf.nextIndex[server] -= 1
 							rf.mu.Unlock()
 							continue
-						} else {
-							rf.mu.Lock()
-							rf.nextIndex[server] = min(successNextIndex, rf.nextIndex[rf.me])
-							rf.mu.Unlock()
-							break
 						}
+						rf.nextIndex[server] = min(successNextIndex, rf.nextIndex[rf.me])
+						rf.fCh<-struct{}{}
 					} else {
 						break
 					}
@@ -780,27 +777,6 @@ func (rf *Raft) sendHeartBeatMessages() {
 			}(i)
 		}
 	}
-}
-
-func (rf *Raft) sendHeartBeatMessage(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	ok := rf.sendAppendEntries(server, args, reply)
-	if ok {
-		if !reply.Success {
-			rf.mu.Lock()
-			passed := rf.checkTerm(reply.Term)
-			if !passed {
-				rf.mu.Unlock()
-				return false
-			} else {
-				rf.nextIndex[server] -= 1
-			}
-			rf.mu.Unlock()
-			return false
-		}
-		rf.fCh<-struct{}{}
-		return true
-	}
-	return false
 }
 
 func (rf *Raft) prevLogEntry(server int) logEntry {
