@@ -388,8 +388,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if !isLeader {
 		return index, term, false
 	} else {
+		rf.nextIndex[rf.me] += 1
 		go rf.startAgreement(command)
-		return rf.commitIndex+1, rf.currentTerm, true
+		return rf.nextIndex[rf.me]-1, rf.currentTerm, true
 	}
 
 	return index, term, isLeader
@@ -716,10 +717,9 @@ func (rf *Raft) sendAppendEntriesMessages() {
 							rf.nextIndex[server] = ni
 							rf.matchIndex[server] = ni-1
 
-							if hasSafelyReplicated(rf.matchIndex, ni-1) && rf.nextIndex[rf.me] < ni {
+							if hasSafelyReplicated(rf.matchIndex, ni-1) && rf.commitIndex < ni-1 {
 								rf.PDPrintf("entries %v safely replicated", entries)
 								rf.commitIndex = ni-1
-								rf.nextIndex[rf.me] = ni
 							}
 						}
 						rf.fCh<- struct{}{}
