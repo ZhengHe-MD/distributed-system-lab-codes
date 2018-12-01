@@ -389,38 +389,31 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return index, term, false
 	} else {
 		rf.nextIndex[rf.me] += 1
-		go rf.startAgreement(command)
+		// raft paper p6
+		// appends the command to its log as a new entry.
+		// each log entry stores a state machine command
+		// alone with the term number.
+		ll := rf.lastLogEntry()
+
+		e := logEntry{
+			Index:   ll.Index+1,
+			Term:    rf.currentTerm,
+			Command: command,
+		}
+		rf.PDPrintf("new log entry: %v", e)
+
+		// issues AppendEntries RPCs in parallel to each
+		// of the other servers to replicate the entry.
+		// if followers crash or run slowly, or if the
+		// network packets are lost, the leader retries
+		// AppendEntries RPCs indefinitely
+		rf.logs = append(rf.logs, e)
+		rf.matchIndex[rf.me] = rf.commitIndex + 1
+		rf.sendAppendEntriesMessages()
 		return rf.nextIndex[rf.me]-1, rf.currentTerm, true
 	}
 
 	return index, term, isLeader
-}
-
-func (rf *Raft) startAgreement(command interface{}) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	// raft paper p6
-	// appends the command to its log as a new entry.
-	// each log entry stores a state machine command
-	// alone with the term number.
-	ll := rf.lastLogEntry()
-
-	e := logEntry{
-		Index:   ll.Index+1,
-		Term:    rf.currentTerm,
-		Command: command,
-	}
-	rf.PDPrintf("new log entry: %v", e)
-
-	// issues AppendEntries RPCs in parallel to each
-	// of the other servers to replicate the entry.
-	// if followers crash or run slowly, or if the
-	// network packets are lost, the leader retries
-	// AppendEntries RPCs indefinitely
-	rf.logs = append(rf.logs, e)
-	rf.matchIndex[rf.me] = rf.commitIndex + 1
-	rf.sendAppendEntriesMessages()
 }
 
 //
@@ -533,10 +526,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// log[lastApplied] to state machine
 	go func() {
 		for {
-			//rf.PDPrintf("rf.logs %v, rf.term %v, rf.nextIndex %d, rf.commitIndex %d, rf.lastApplied %d",
-			//	rf.logs, rf.currentTerm, rf.nextIndex, rf.commitIndex, rf.lastApplied)
-			rf.PDPrintf("rf.term %v, rf.nextIndex %d, rf.commitIndex %d, rf.lastApplied %d",
-				rf.currentTerm, rf.nextIndex, rf.commitIndex, rf.lastApplied)
+			rf.PDPrintf("rf.logs %v, rf.term %v, rf.nextIndex %d, rf.commitIndex %d, rf.lastApplied %d",
+				rf.logs, rf.currentTerm, rf.nextIndex, rf.commitIndex, rf.lastApplied)
+			//rf.PDPrintf("rf.term %v, rf.nextIndex %d, rf.commitIndex %d, rf.lastApplied %d",
+			//	rf.currentTerm, rf.nextIndex, rf.commitIndex, rf.lastApplied)
 			if rf.commitIndex > rf.lastApplied {
 				le := rf.logs[rf.lastApplied]
 				rf.applyCh<-ApplyMsg{
