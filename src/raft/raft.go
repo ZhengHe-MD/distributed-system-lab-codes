@@ -463,9 +463,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			et := generateET()
 			switch rf.role {
 			case LEADER: {
-				//go rf.sendHeartBeatMessages()
 				// send heartbeat messages
-				go rf.sendAppendEntriesMessages()
+				rf.sendAppendEntriesMessages()
 				select {
 				case <-rf.fCh: {
 					time.Sleep(HEART_BEAT_TIMEOUT)
@@ -534,8 +533,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// log[lastApplied] to state machine
 	go func() {
 		for {
-			rf.PDPrintf("rf.logs %v, rf.term %v, rf.nextIndex %d, rf.commitIndex %d, rf.lastApplied %d",
-				rf.logs, rf.currentTerm, rf.nextIndex, rf.commitIndex, rf.lastApplied)
+			//rf.PDPrintf("rf.logs %v, rf.term %v, rf.nextIndex %d, rf.commitIndex %d, rf.lastApplied %d",
+			//	rf.logs, rf.currentTerm, rf.nextIndex, rf.commitIndex, rf.lastApplied)
+			rf.PDPrintf("rf.term %v, rf.nextIndex %d, rf.commitIndex %d, rf.lastApplied %d",
+				rf.currentTerm, rf.nextIndex, rf.commitIndex, rf.lastApplied)
 			if rf.commitIndex > rf.lastApplied {
 				le := rf.logs[rf.lastApplied]
 				rf.applyCh<-ApplyMsg{
@@ -676,6 +677,11 @@ func (rf *Raft) sendAppendEntriesMessages() {
 		if i != rf.me {
 			go func(server int) {
 				for {
+					// without asserting role, even if turned into FOLLOWER or CANDIDATE,
+					// the rf node will continue sending append entries to other nodes
+					if rf.role != LEADER {
+						return
+					}
 					// different peers can receive different entries
 					rf.mu.Lock()
 
@@ -694,7 +700,8 @@ func (rf *Raft) sendAppendEntriesMessages() {
 					rf.mu.Unlock()
 
 					reply := AppendEntriesReply{}
-					rf.PDPrintf("sends AppendEntries to %d, with entries %v", server, entries)
+					//rf.PDPrintf("sends AppendEntries to %d, with entries %v", server, entries)
+					rf.PDPrintf("sends AppendEntries to %d, with entries length %d", server, len(entries))
 					ok := rf.sendAppendEntries(server, &args, &reply)
 					if ok {
 						if !reply.Success {
@@ -710,7 +717,8 @@ func (rf *Raft) sendAppendEntriesMessages() {
 						}
 
 						if rf.role == LEADER && rf.currentTerm == reply.Term {
-							rf.PDPrintf("entries %v replicated to %d", entries, server)
+							//rf.PDPrintf("entries %v replicated to %d", entries, server)
+							rf.PDPrintf("entries length %d replicated to %d", len(entries), server)
 							// when safely replicated, the leader applies the
 							// entry to its state machine and returns the result
 							// of that execution to the client
@@ -718,7 +726,8 @@ func (rf *Raft) sendAppendEntriesMessages() {
 							rf.matchIndex[server] = ni-1
 
 							if hasSafelyReplicated(rf.matchIndex, ni-1) && rf.commitIndex < ni-1 {
-								rf.PDPrintf("entries %v safely replicated", entries)
+								//rf.PDPrintf("entries %v safely replicated", entries)
+								rf.PDPrintf("entries length %d safely replicated", len(entries))
 								rf.commitIndex = ni-1
 							}
 						}
