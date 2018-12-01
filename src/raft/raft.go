@@ -108,6 +108,7 @@ type Raft struct {
 	lCh		 		chan LeaderMsg 		// use to suggest any valid communication from leader
 	cCh 			chan interface{} 	// use to suggest any valid communication from candidate
 	aslCh 			chan interface{}    // use to suggest has become leader
+	rCh 			chan interface{}    // use to suggest role changes
 	applyCh 		chan ApplyMsg
 }
 
@@ -222,7 +223,7 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	rf.PDPrintf("receive RequestVote from %d", args.CandidateID)
+	rf.PDPrintf("receive RequestVote from %d, with term %d", args.CandidateID, args.Term)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -451,6 +452,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// if no communication: begins a new election
 	// if receive valid RPCs from a leader or candidate, remains in follower state
+	// TODO: refactor to a role change channel
 	go func() {
 		for {
 			et := generateET()
@@ -461,6 +463,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				select {
 				case <-rf.fCh: {
 					time.Sleep(HEART_BEAT_TIMEOUT)
+					continue
+				}
+				case <-rf.cCh: {
+					rf.PDPrintf("receive valid message from candidate, but should not")
 					continue
 				}
 				case leaderMsg := <-rf.lCh: {
@@ -565,6 +571,7 @@ func (rf *Raft) initServer() {
 	rf.fCh = make(chan interface{})
 	rf.lCh = make(chan LeaderMsg)
 	rf.cCh = make(chan interface{})
+	rf.rCh = make(chan interface{})
 	rf.aslCh = make(chan interface{})
 
 
@@ -767,6 +774,7 @@ func (rf *Raft) checkTerm(term int) bool {
 	if term > rf.currentTerm {
 		rf.role = FOLLOWER
 		rf.currentTerm = term
+		rf.votedFor = NOBODY
 		return false
 	} else {
 		return true
@@ -789,6 +797,7 @@ func (rf *Raft) checkVoteConsistency(args *RequestVoteArgs) bool {
 	var voteGranted bool
 	if len(rf.logs) > 0 && args.LastLogIndex > 0 {
 		ll := rf.lastLogEntry()
+		rf.PDPrintf("args %v, last log entry: %v\n", args, ll)
 		if args.LastLogTerm > ll.Term {
 			voteGranted = true
 		}
