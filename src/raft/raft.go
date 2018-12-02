@@ -103,6 +103,7 @@ type Raft struct {
 
 	// Other States
 	role 			int
+	killed 			bool 				// use to suggest this instance has been killed, only for tests
 	votes 			[]bool
 	fCh				chan interface{}	// use to suggest any valid communication from follower
 	lCh		 		chan LeaderMsg 		// use to suggest any valid communication from leader
@@ -141,15 +142,9 @@ func (rf *Raft) persist() {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 
-	rf.mu.Lock()
-	term := rf.currentTerm
-	votedFor := rf.votedFor
-	logs := rf.logs
-	rf.mu.Unlock()
-
-	e.Encode(term)
-	e.Encode(votedFor)
-	e.Encode(logs)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logs[:rf.commitIndex])
 
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
@@ -189,6 +184,8 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
 		rf.logs = logs
+		rf.PDPrintf("read persistent data, term %d, votedFor %d, logs %v",
+			rf.currentTerm, rf.votedFor, rf.logs)
 	}
 }
 
@@ -227,29 +224,28 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if args.Term < rf.currentTerm {
-		reply.Term = rf.currentTerm
-		reply.VoteGranted = false
-		return
-	}
-
 	var voteGranted bool
+
 	if args.Term == rf.currentTerm {
 		if rf.votedFor == NOBODY || rf.votedFor == args.CandidateID {
 			voteGranted = rf.checkVoteConsistency(args)
 		}
-	} else {
+	} else if args.Term > rf.currentTerm {
 		voteGranted = rf.checkVoteConsistency(args)
 		rf.currentTerm = args.Term
 		rf.role = FOLLOWER
 	}
 
+	if voteGranted {
+		rf.votedFor = args.CandidateID
+		rf.cCh<- struct{}{}
+	}
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = voteGranted
-	if voteGranted {
-		rf.cCh<-struct{}{}
-	}
-	return
+
+	// persist state before responding to RPCs
+	// term, votedFor may have changed
+	rf.persist()
 }
 
 //
@@ -328,6 +324,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if !found {
 			reply.Term = rf.currentTerm
 			reply.Success = false
+			rf.persist()
 			return
 		}
 	} else {
@@ -352,6 +349,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Term = args.Term
 	reply.Success = true
+
+	// persists state before responding to RPCs
+	// term, logs may be changed
+	rf.persist()
+
 	return
 }
 
@@ -425,6 +427,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
+	rf.PDPrintf("I'm killed")
+	rf.killed = true
 }
 
 //
@@ -528,9 +532,30 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		}
 	}()
 
-	// if commitIndex > lastApplied: increment lastApplied, apply
-	// log[lastApplied] to state machine
+
 	go func() {
+		// Raft Paper Figure 2
+		// If there exists an N such that N > commitIndex, a majority
+		// of matchIndex[i] >= N, and log[N].term == currentTerm: set
+		// commitIndex = N
+		// TODO: don't known when this code will be used. to be figured out
+		rf.mu.Lock()
+		if rf.role == LEADER {
+			ll := len(rf.logs)
+			if ll > rf.commitIndex {
+				for i := rf.commitIndex+1; i < ll; i++ {
+					if hasSafelyReplicated(rf.matchIndex, i) && rf.logs[i].Term == rf.currentTerm {
+						rf.commitIndex = i
+					} else {
+						break
+					}
+				}
+			}
+		}
+		rf.mu.Unlock()
+
+		// if commitIndex > lastApplied: increment lastApplied, apply
+		// log[lastApplied] to state machine
 		for {
 			rf.PDPrintf("rf.logs %v, rf.term %v, rf.nextIndex %d, rf.commitIndex %d, rf.lastApplied %d",
 				rf.logs, rf.currentTerm, rf.nextIndex, rf.commitIndex, rf.lastApplied)
@@ -566,7 +591,7 @@ func (rf *Raft) initServer() {
 	// raft p5 5.2
 	// When servers start up, they begin as followers.
 	rf.role = FOLLOWER
-
+	rf.killed = false
 	rf.votes = make([]bool, len(rf.peers))
 	rf.fCh = make(chan interface{})
 	rf.lCh = make(chan LeaderMsg)
@@ -577,6 +602,16 @@ func (rf *Raft) initServer() {
 
 	// initialize from state persisted before a crash
 	rf.readPersist(rf.persister.ReadRaftState())
+	for _, le := range rf.logs {
+		rf.commitIndex = le.Index
+		// apply msg
+		rf.applyCh<-ApplyMsg{
+			CommandValid: true,
+			Command:      le.Command,
+			CommandIndex: le.Index,
+		}
+		rf.lastApplied = le.Index
+	}
 	// initialization ends
 }
 
@@ -590,18 +625,6 @@ func (rf *Raft) initNextIndex() {
 	}
 }
 
-func (rf *Raft) removeUncommittedLogsBeforeCurrentTerm() {
-	pos := -1
-	for i, le := range rf.logs {
-		if le.Index > rf.commitIndex {
-			pos = i
-		}
-	}
-	if pos > 0 {
-		rf.logs = rf.logs[:pos]
-	}
-}
-
 func (rf *Raft) beginNewElection() {
 	// increase current term
 	rf.mu.Lock()
@@ -612,6 +635,8 @@ func (rf *Raft) beginNewElection() {
 	rf.votes[rf.me] = true
 	// transition to candidate state
 	rf.role = CANDIDATE
+	// should persist state because the votedFor and currentTerm has changed
+	rf.persist()
 	// issues RequestVote RPCs in parallel to each of the other servers
 	for i, _ := range rf.peers {
 		if i != rf.me {
@@ -645,30 +670,28 @@ func (rf *Raft) issueRequestVote(server int) {
 			rf.mu.Lock()
 			rf.PDPrintf("request vote reply %v", reply)
 			passed := rf.checkTerm(reply.Term)
-			if !passed {
-				rf.mu.Unlock()
-				break
-			}
-
-			if rf.role == CANDIDATE && reply.VoteGranted {
-				rf.PDPrintf("receive vote from %d", server)
-				rf.votes[server] = true
-				if hasMajorityVotes(rf.votes) {
-					rf.PDPrintf("becomes LEADER")
-					// gain majority votes: becomes LEADER
-					rf.role = LEADER
-					rf.votes = make([]bool, len(rf.peers))
-					// remove uncommitted logs if the term is different, must before initNextIndex
-					rf.removeUncommittedLogsBeforeCurrentTerm()
-					rf.initNextIndex()
-					rf.aslCh<-struct{}{}
+			if passed {
+				if rf.role == CANDIDATE && reply.VoteGranted {
+					rf.PDPrintf("receive vote from %d", server)
+					rf.votes[server] = true
+					if hasMajorityVotes(rf.votes) {
+						rf.PDPrintf("becomes LEADER")
+						// gain majority votes: becomes LEADER
+						rf.role = LEADER
+						rf.votes = make([]bool, len(rf.peers))
+						rf.initNextIndex()
+						rf.aslCh<-struct{}{}
+					}
 				}
+			} else {
+				// because the currentTerm has changed
+				rf.persist()
 			}
 			rf.mu.Unlock()
-			break
+			return
+		} else {
+			time.Sleep(REQUEST_VOTE_TIMEOUT)
 		}
-
-		time.Sleep(REQUEST_VOTE_TIMEOUT)
 	}
 }
 
@@ -704,37 +727,38 @@ func (rf *Raft) sendAppendEntriesMessages() {
 					rf.PDPrintf("sends AppendEntries to %d, with entries length %d", server, len(entries))
 					ok := rf.sendAppendEntries(server, &args, &reply)
 					if ok {
+						rf.mu.Lock()
 						if !reply.Success {
-							rf.mu.Lock()
 							passed := rf.checkTerm(reply.Term)
-							if !passed {
-								rf.mu.Unlock()
-								break
+							if passed {
+								rf.nextIndex[server] -= 1
 							}
-							rf.nextIndex[server] -= 1
-							rf.mu.Unlock()
-							continue
-						}
+						} else {
+							if rf.role == LEADER && rf.currentTerm == reply.Term {
+								//rf.PDPrintf("entries %v replicated to %d", entries, server)
+								rf.PDPrintf("entries length %d replicated to %d", len(entries), server)
+								// when safely replicated, the leader applies the
+								// entry to its state machine and returns the result
+								// of that execution to the client
+								rf.nextIndex[server] = ni
+								rf.matchIndex[server] = ni-1
 
-						if rf.role == LEADER && rf.currentTerm == reply.Term {
-							//rf.PDPrintf("entries %v replicated to %d", entries, server)
-							rf.PDPrintf("entries length %d replicated to %d", len(entries), server)
-							// when safely replicated, the leader applies the
-							// entry to its state machine and returns the result
-							// of that execution to the client
-							rf.nextIndex[server] = ni
-							rf.matchIndex[server] = ni-1
-
-							if hasSafelyReplicated(rf.matchIndex, ni-1) && rf.commitIndex < ni-1 {
-								//rf.PDPrintf("entries %v safely replicated", entries)
-								rf.PDPrintf("entries length %d safely replicated", len(entries))
-								rf.commitIndex = ni-1
+								if hasSafelyReplicated(rf.matchIndex, ni-1) && rf.commitIndex < ni-1 {
+									//rf.PDPrintf("entries %v safely replicated", entries)
+									rf.PDPrintf("entries length %d safely replicated", len(entries))
+									rf.commitIndex = ni-1
+								}
 							}
 						}
-						rf.fCh<- struct{}{}
-						break
+						rf.persist()
+						rf.mu.Unlock()
+
+						if reply.Success {
+							rf.fCh<- struct{}{}
+						}
+					} else {
+						time.Sleep(APPEND_ENTRIES_TIMEOUT)
 					}
-					time.Sleep(APPEND_ENTRIES_TIMEOUT)
 				}
 			}(i)
 		}
@@ -895,6 +919,10 @@ func min(a, b int) int {
 }
 
 func (rf *Raft) PDPrintf(format string, a ...interface{}) (n int, err error) {
+	if rf.killed {
+		return
+	}
+
 	roleString := ""
 	switch rf.role {
 	case FOLLOWER:
@@ -904,7 +932,7 @@ func (rf *Raft) PDPrintf(format string, a ...interface{}) (n int, err error) {
 	case LEADER:
 		roleString = "L"
 	}
-	head := fmt.Sprintf("[Peer %d Role %s Term %d]: ", rf.me, roleString, rf.currentTerm)
+	head := fmt.Sprintf("[Term %d Role %s Peer %d]: ", rf.currentTerm, roleString, rf.me)
 	DPrintf(head + format, a...)
 	return
 }
