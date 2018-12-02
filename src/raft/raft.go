@@ -461,62 +461,27 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// if no communication: begins a new election
 	// if receive valid RPCs from a leader or candidate, remains in follower state
-	// TODO: refactor to a role change channel
 	go func() {
 		for {
 			et := generateET()
-			switch rf.role {
-			case LEADER: {
-				// send heartbeat messages
+			rf.PDPrintf("new election timeout: %d", et)
+
+			if rf.role == LEADER {
 				rf.sendAppendEntriesMessages()
-				select {
-				case <-rf.fCh: {
+			}
+
+			select {
+			case <-rf.fCh: {
+				if rf.role == LEADER {
 					time.Sleep(HEART_BEAT_TIMEOUT)
-					continue
-				}
-				case <-rf.cCh: {
-					rf.PDPrintf("receive valid message from candidate, but should not")
-					continue
-				}
-				case <-rf.lCh: {
-					continue
-				}
-				case <-time.After(time.Millisecond * time.Duration(et)): {
-					rf.PDPrintf("election timeout as a leader and begins a new election")
-					rf.beginNewElection()
-				}
 				}
 			}
-			case CANDIDATE: {
-				select {
-				case <-rf.lCh: {
-					rf.PDPrintf("receive valid message from leader")
-				}
-				case <-rf.cCh:
-					rf.PDPrintf("receive valid message from candidate, but should not")
-				case <-rf.aslCh:
-					continue
-				case <-time.After(time.Millisecond * time.Duration(et)):
-					rf.PDPrintf("election timeout as a candidate and begins a new election")
-					rf.beginNewElection()
-				}
-			}
-			case FOLLOWER: {
-				rf.PDPrintf("new election timeout: %d", et)
-				select {
-				case <-rf.cCh:
-					rf.PDPrintf("receive valid message from candidate")
-					continue
-				case <-rf.lCh:
-					rf.PDPrintf("receive valid message from leader")
-					continue
-				case <-time.After(time.Millisecond * time.Duration(et)):
-					// if it is FOLLOWER, begins a new election
-					if rf.role == FOLLOWER {
-						rf.PDPrintf("begins a new election")
-						rf.beginNewElection()
-					}
-				}
+			case <-rf.cCh:
+			case <-rf.lCh:
+			case <-rf.aslCh:
+			case <-time.After(time.Millisecond * time.Duration(et)): {
+				rf.PDPrintf("begins a new election")
+				rf.beginNewElection()
 			}
 			}
 		}
