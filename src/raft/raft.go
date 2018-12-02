@@ -33,8 +33,8 @@ const (
 	ELECTION_TIMEOUT_UB = 300
 
 	REQUEST_VOTE_TIMEOUT = 20 * time.Millisecond
-	APPEND_ENTRIES_TIMEOUT = 50 * time.Millisecond
-	HEART_BEAT_TIMEOUT = 50 * time.Millisecond
+	APPEND_ENTRIES_TIMEOUT = 100 * time.Millisecond
+	HEART_BEAT_TIMEOUT = 100 * time.Millisecond
 	CHECK_LAST_APPLIED_TIMEOUT = 50 * time.Millisecond
 
     RPC_APPEND_ENTRIES = "Raft.AppendEntries"
@@ -904,7 +904,7 @@ func (rf *Raft) PDPrintf(format string, a ...interface{}) (n int, err error) {
 	case LEADER:
 		roleString = "L"
 	}
-	head := fmt.Sprintf("[Peer %d Role %s]: ", rf.me, roleString)
+	head := fmt.Sprintf("[Peer %d Role %s Term %d]: ", rf.me, roleString, rf.currentTerm)
 	DPrintf(head + format, a...)
 	return
 }
