@@ -106,7 +106,7 @@ type Raft struct {
 	killed 			bool 				// use to suggest this instance has been killed, only for tests
 	votes 			[]bool
 	fCh				chan interface{}	// use to suggest any valid communication from follower
-	lCh		 		chan LeaderMsg 		// use to suggest any valid communication from leader
+	lCh		 		chan interface{} 	// use to suggest any valid communication from leader
 	cCh 			chan interface{} 	// use to suggest any valid communication from candidate
 	aslCh 			chan interface{}    // use to suggest has become leader
 	rCh 			chan interface{}    // use to suggest role changes
@@ -307,13 +307,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
+	// a candidate may receive an AppendEntries RPC from another
+	// server claiming to be leader. If the leader's term is at least
+	// as large as the candidate's current term, then the candidate
+	// recognizes the leader as legitimate and returns to follower state
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
-		rf.role = FOLLOWER
 	}
 
 	// it's a valid message, so start a new election timeout by lCh
-	rf.lCh <- LeaderMsg{Term: args.Term, LeaderId: args.LeaderId}
+	rf.role = FOLLOWER
+	rf.votedFor = args.LeaderId
+	rf.lCh<-struct{}{}
 
 	// 2. Reply false if log doesn't contain an entry at prevLogIndex
 	// whose term matches prevLogTerm. (Consistency Check)
@@ -473,9 +478,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					rf.PDPrintf("receive valid message from candidate, but should not")
 					continue
 				}
-				case leaderMsg := <-rf.lCh: {
-					rf.role = FOLLOWER
-					rf.currentTerm = leaderMsg.Term
+				case <-rf.lCh: {
 					continue
 				}
 				case <-time.After(time.Millisecond * time.Duration(et)): {
@@ -486,21 +489,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			}
 			case CANDIDATE: {
 				select {
-				case leaderMsg := <-rf.lCh: {
+				case <-rf.lCh: {
 					rf.PDPrintf("receive valid message from leader")
-					// a candidate may receive an AppendEntries RPC from another
-					// server claiming to be leader. If the leader's term is at least
-					// as large as the candidate's current term, then the candidate
-					// recognizes the leader as legitimate and returns to follower state
-					//
-					// NOTE:
-					// only when leaderMsg.Term >= rf.currentTerm, will the message
-					// be sent on rf.lCh, so there is no need to check here
-					rf.mu.Lock()
-					rf.role = FOLLOWER
-					rf.currentTerm = leaderMsg.Term
-					rf.votedFor = leaderMsg.LeaderId
-					rf.mu.Unlock()
 				}
 				case <-rf.cCh:
 					rf.PDPrintf("receive valid message from candidate, but should not")
@@ -594,7 +584,7 @@ func (rf *Raft) initServer() {
 	rf.killed = false
 	rf.votes = make([]bool, len(rf.peers))
 	rf.fCh = make(chan interface{})
-	rf.lCh = make(chan LeaderMsg)
+	rf.lCh = make(chan interface{})
 	rf.cCh = make(chan interface{})
 	rf.rCh = make(chan interface{})
 	rf.aslCh = make(chan interface{})
