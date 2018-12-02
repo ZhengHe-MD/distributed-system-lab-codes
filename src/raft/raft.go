@@ -109,7 +109,6 @@ type Raft struct {
 	lCh		 		chan interface{} 	// use to suggest any valid communication from leader
 	cCh 			chan interface{} 	// use to suggest any valid communication from candidate
 	aslCh 			chan interface{}    // use to suggest has become leader
-	rCh 			chan interface{}    // use to suggest role changes
 	applyCh 		chan ApplyMsg
 }
 
@@ -551,7 +550,6 @@ func (rf *Raft) initServer() {
 	rf.fCh = make(chan interface{})
 	rf.lCh = make(chan interface{})
 	rf.cCh = make(chan interface{})
-	rf.rCh = make(chan interface{})
 	rf.aslCh = make(chan interface{})
 
 
