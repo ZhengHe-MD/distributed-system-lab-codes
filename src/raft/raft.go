@@ -143,7 +143,7 @@ func (rf *Raft) persist() {
 
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
-	e.Encode(rf.logs[:rf.commitIndex])
+	e.Encode(rf.logs)
 
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
@@ -395,7 +395,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if !isLeader {
 		return index, term, false
 	} else {
-		rf.nextIndex[rf.me] += 1
 		// raft paper p6
 		// appends the command to its log as a new entry.
 		// each log entry stores a state machine command
@@ -409,15 +408,16 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		}
 		rf.PDPrintf("new log entry: %v", e)
 
+		rf.nextIndex[rf.me] = e.Index+1
 		// issues AppendEntries RPCs in parallel to each
 		// of the other servers to replicate the entry.
 		// if followers crash or run slowly, or if the
 		// network packets are lost, the leader retries
 		// AppendEntries RPCs indefinitely
 		rf.logs = append(rf.logs, e)
-		rf.matchIndex[rf.me] = rf.commitIndex + 1
+		rf.matchIndex[rf.me] = e.Index
 		rf.sendAppendEntriesMessages()
-		return rf.nextIndex[rf.me]-1, rf.currentTerm, true
+		return e.Index, rf.currentTerm, true
 	}
 
 	return index, term, isLeader
@@ -555,16 +555,6 @@ func (rf *Raft) initServer() {
 
 	// initialize from state persisted before a crash
 	rf.readPersist(rf.persister.ReadRaftState())
-	for _, le := range rf.logs {
-		rf.commitIndex = le.Index
-		// apply msg
-		rf.applyCh<-ApplyMsg{
-			CommandValid: true,
-			Command:      le.Command,
-			CommandIndex: le.Index,
-		}
-		rf.lastApplied = le.Index
-	}
 	// initialization ends
 }
 
@@ -661,14 +651,14 @@ func (rf *Raft) sendAppendEntriesMessages() {
 					// different peers can receive different entries
 					rf.mu.Lock()
 
-					ll := rf.prevLogEntry(server)
+					ple := rf.prevLogEntry(server)
+					lle := rf.lastLogEntry()
 					entries := rf.nextLogEntries(server)
-					ni := rf.nextIndex[server] + len(entries)
 					args := AppendEntriesArgs{
 						Term:         rf.currentTerm,
 						LeaderId:     rf.me,
-						PrevLogIndex: ll.Index,
-						PrevLogTerm:  ll.Term,
+						PrevLogIndex: ple.Index,
+						PrevLogTerm:  ple.Term,
 						Entries:      entries,
 						LeaderCommit: rf.commitIndex,
 					}
@@ -693,13 +683,15 @@ func (rf *Raft) sendAppendEntriesMessages() {
 								// when safely replicated, the leader applies the
 								// entry to its state machine and returns the result
 								// of that execution to the client
-								rf.nextIndex[server] = ni
-								rf.matchIndex[server] = ni-1
+								rf.nextIndex[server] = lle.Index+1
+								rf.matchIndex[server] = lle.Index
 
-								if hasSafelyReplicated(rf.matchIndex, ni-1) && rf.commitIndex < ni-1 {
+								if hasSafelyReplicated(rf.matchIndex, lle.Index) {
 									//rf.PDPrintf("entries %v safely replicated", entries)
 									rf.PDPrintf("entries length %d safely replicated", len(entries))
-									rf.commitIndex = ni-1
+									if rf.commitIndex < lle.Index {
+										rf.commitIndex = lle.Index
+									}
 								}
 							}
 						}
