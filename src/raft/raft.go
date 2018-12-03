@@ -35,7 +35,7 @@ const (
 	REQUEST_VOTE_TIMEOUT = 20 * time.Millisecond
 	APPEND_ENTRIES_TIMEOUT = 100 * time.Millisecond
 	HEART_BEAT_TIMEOUT = 100 * time.Millisecond
-	CHECK_LAST_APPLIED_TIMEOUT = 50 * time.Millisecond
+	CHECK_LAST_APPLIED_TIMEOUT = 20 * time.Millisecond
 
     RPC_APPEND_ENTRIES = "Raft.AppendEntries"
     RPC_REQUEST_VOTE = "Raft.RequestVote"
@@ -314,11 +314,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.currentTerm = args.Term
 	}
 
-	// it's a valid message, so start a new election timeout by lCh
-	rf.role = FOLLOWER
-	rf.votedFor = args.LeaderId
-	rf.lCh<-struct{}{}
-
 	// 2. Reply false if log doesn't contain an entry at prevLogIndex
 	// whose term matches prevLogTerm. (Consistency Check)
 	var prevIndex int
@@ -334,6 +329,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	} else {
 		prevIndex = -1
 	}
+
+	// it's a valid message, so start a new election timeout by lCh
+	rf.role = FOLLOWER
+	rf.votedFor = args.LeaderId
+	rf.lCh<-struct{}{}
 
 	// 3. if an existing entry conflicts with a new one(same index
 	// but different terms), delete the existing entry and all that
@@ -417,6 +417,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.logs = append(rf.logs, e)
 		rf.matchIndex[rf.me] = e.Index
 		rf.sendAppendEntriesMessages()
+		rf.persist()
 		return e.Index, rf.currentTerm, true
 	}
 
@@ -488,29 +489,25 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 
 	go func() {
-		// Raft Paper Figure 2
-		// If there exists an N such that N > commitIndex, a majority
-		// of matchIndex[i] >= N, and log[N].term == currentTerm: set
-		// commitIndex = N
-		// TODO: don't known when this code will be used. to be figured out
-		rf.mu.Lock()
-		if rf.role == LEADER {
-			ll := len(rf.logs)
-			if ll > rf.commitIndex {
-				for i := rf.commitIndex+1; i < ll; i++ {
-					if hasSafelyReplicated(rf.matchIndex, i) && rf.logs[i].Term == rf.currentTerm {
-						rf.commitIndex = i
-					} else {
+		for {
+			// Raft Paper Figure 2
+			// If there exists an N such that N > commitIndex, a majority
+			// of matchIndex[i] >= N, and log[N].term == currentTerm: set
+			// commitIndex = N
+			// PURPOSE: split checking logic and replication apart
+			rf.mu.Lock()
+			if rf.role == LEADER {
+				for _, le := range rf.logs[rf.commitIndex:] {
+					if hasSafelyReplicated(rf.matchIndex, le.Index) && le.Term == rf.currentTerm {
+						rf.commitIndex = le.Index
 						break
 					}
 				}
 			}
-		}
-		rf.mu.Unlock()
+			rf.mu.Unlock()
 
-		// if commitIndex > lastApplied: increment lastApplied, apply
-		// log[lastApplied] to state machine
-		for {
+			// if commitIndex > lastApplied: increment lastApplied, apply
+			// log[lastApplied] to state machine
 			rf.PDPrintf("rf.logs %v, rf.term %v, rf.nextIndex %d, rf.commitIndex %d, rf.lastApplied %d",
 				rf.logs, rf.currentTerm, rf.nextIndex, rf.commitIndex, rf.lastApplied)
 			//rf.PDPrintf("rf.term %v, rf.nextIndex %d, rf.commitIndex %d, rf.lastApplied %d",
@@ -626,9 +623,6 @@ func (rf *Raft) issueRequestVote(server int) {
 						rf.aslCh<-struct{}{}
 					}
 				}
-			} else {
-				// because the currentTerm has changed
-				rf.persist()
 			}
 			rf.mu.Unlock()
 			return
@@ -685,17 +679,8 @@ func (rf *Raft) sendAppendEntriesMessages() {
 								// of that execution to the client
 								rf.nextIndex[server] = lle.Index+1
 								rf.matchIndex[server] = lle.Index
-
-								if hasSafelyReplicated(rf.matchIndex, lle.Index) {
-									//rf.PDPrintf("entries %v safely replicated", entries)
-									rf.PDPrintf("entries length %d safely replicated", len(entries))
-									if rf.commitIndex < lle.Index {
-										rf.commitIndex = lle.Index
-									}
-								}
 							}
 						}
-						rf.persist()
 						rf.mu.Unlock()
 
 						if reply.Success {
@@ -744,6 +729,7 @@ func (rf *Raft) checkTerm(term int) bool {
 		rf.role = FOLLOWER
 		rf.currentTerm = term
 		rf.votedFor = NOBODY
+		rf.persist()
 		return false
 	} else {
 		return true
@@ -849,7 +835,7 @@ func hasSafelyReplicated(matchIndex []int, targetIndex int) bool {
 	total := len(matchIndex)
 	count := 0
 	for _, index := range matchIndex {
-		if index == targetIndex {
+		if index >= targetIndex {
 			count += 1
 		}
 	}
