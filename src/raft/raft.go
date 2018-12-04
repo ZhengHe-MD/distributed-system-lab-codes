@@ -33,7 +33,7 @@ const (
 	ELECTION_TIMEOUT_UB = 300
 
 	REQUEST_VOTE_TIMEOUT = 20 * time.Millisecond
-	HEART_BEAT_TIMEOUT = 20 * time.Millisecond
+	HEART_BEAT_TIMEOUT = 50 * time.Millisecond
 	CHECK_LAST_APPLIED_TIMEOUT = 20 * time.Millisecond
 
     RPC_APPEND_ENTRIES = "Raft.AppendEntries"
