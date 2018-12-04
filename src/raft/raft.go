@@ -33,8 +33,7 @@ const (
 	ELECTION_TIMEOUT_UB = 300
 
 	REQUEST_VOTE_TIMEOUT = 20 * time.Millisecond
-	APPEND_ENTRIES_TIMEOUT = 100 * time.Millisecond
-	HEART_BEAT_TIMEOUT = 100 * time.Millisecond
+	HEART_BEAT_TIMEOUT = 20 * time.Millisecond
 	CHECK_LAST_APPLIED_TIMEOUT = 20 * time.Millisecond
 
     RPC_APPEND_ENTRIES = "Raft.AppendEntries"
@@ -416,7 +415,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		// AppendEntries RPCs indefinitely
 		rf.logs = append(rf.logs, e)
 		rf.matchIndex[rf.me] = e.Index
-		rf.sendAppendEntriesMessages()
 		rf.persist()
 		return e.Index, rf.currentTerm, true
 	}
@@ -466,16 +464,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			et := generateET()
 			rf.PDPrintf("new election timeout: %d", et)
 
-			if rf.role == LEADER {
-				rf.sendAppendEntriesMessages()
-			}
-
 			select {
-			case <-rf.fCh: {
-				if rf.role == LEADER {
-					time.Sleep(HEART_BEAT_TIMEOUT)
-				}
-			}
+			case <-rf.fCh:
 			case <-rf.cCh:
 			case <-rf.lCh:
 			case <-rf.aslCh:
@@ -487,6 +477,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		}
 	}()
 
+	go rf.sendAppendEntriesMessages()
 
 	go func() {
 		for {
@@ -496,9 +487,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			// commitIndex = N
 			// PURPOSE: split checking logic and replication apart
 			rf.mu.Lock()
-			if rf.role == LEADER {
+			if rf.role == LEADER && len(rf.logs) > 0{
 				for _, le := range rf.logs[rf.commitIndex:] {
-					if hasSafelyReplicated(rf.matchIndex, le.Index) && le.Term == rf.currentTerm {
+					// Raft paper p9
+					// Raft never commits log entries from previous terms by counting replicas
+					if le.Term != rf.currentTerm {
+						continue
+					}
+					if hasSafelyReplicated(rf.matchIndex, le.Index) {
 						rf.commitIndex = le.Index
 						break
 					}
@@ -609,8 +605,7 @@ func (rf *Raft) issueRequestVote(server int) {
 		if ok {
 			rf.mu.Lock()
 			rf.PDPrintf("request vote reply %v", reply)
-			passed := rf.checkTerm(reply.Term)
-			if passed {
+			if rf.checkTerm(reply.Term) {
 				if rf.role == CANDIDATE && reply.VoteGranted {
 					rf.PDPrintf("receive vote from %d", server)
 					rf.votes[server] = true
@@ -638,13 +633,14 @@ func (rf *Raft) sendAppendEntriesMessages() {
 			go func(server int) {
 				for {
 					// without asserting role, even if turned into FOLLOWER or CANDIDATE,
-					// the rf node will continue sending append entries to other nodes
 					if rf.role != LEADER {
-						return
+						time.Sleep(HEART_BEAT_TIMEOUT)
+						continue
 					}
-					// different peers can receive different entries
-					rf.mu.Lock()
 
+					shouldSleep := true
+					// the rf node will continue sending append entries to other nodes
+					// different peers can receive different entries
 					ple := rf.prevLogEntry(server)
 					lle := rf.lastLogEntry()
 					entries := rf.nextLogEntries(server)
@@ -657,37 +653,37 @@ func (rf *Raft) sendAppendEntriesMessages() {
 						LeaderCommit: rf.commitIndex,
 					}
 
-					rf.mu.Unlock()
-
 					reply := AppendEntriesReply{}
 					//rf.PDPrintf("sends AppendEntries to %d, with entries %v", server, entries)
 					rf.PDPrintf("sends AppendEntries to %d, with entries length %d", server, len(entries))
 					ok := rf.sendAppendEntries(server, &args, &reply)
 					if ok {
 						rf.mu.Lock()
+						isTermValid := rf.checkTerm(reply.Term)
 						if !reply.Success {
-							passed := rf.checkTerm(reply.Term)
-							if passed {
+							if isTermValid {
 								rf.nextIndex[server] -= 1
+								shouldSleep = false
 							}
 						} else {
-							if rf.role == LEADER && rf.currentTerm == reply.Term {
-								//rf.PDPrintf("entries %v replicated to %d", entries, server)
-								rf.PDPrintf("entries length %d replicated to %d", len(entries), server)
-								// when safely replicated, the leader applies the
-								// entry to its state machine and returns the result
-								// of that execution to the client
+							//rf.PDPrintf("entries %v replicated to %d", entries, server)
+							rf.PDPrintf("entries length %d replicated to %d", len(entries), server)
+							// when safely replicated, the leader applies the
+							// entry to its state machine and returns the result
+							// of that execution to the client
+							if rf.nextIndex[server] < lle.Index+1 {
 								rf.nextIndex[server] = lle.Index+1
+							}
+							if rf.matchIndex[server] < lle.Index {
 								rf.matchIndex[server] = lle.Index
 							}
 						}
 						rf.mu.Unlock()
+						rf.fCh<-struct{}{}
+					}
 
-						if reply.Success {
-							rf.fCh<- struct{}{}
-						}
-					} else {
-						time.Sleep(APPEND_ENTRIES_TIMEOUT)
+					if shouldSleep {
+						time.Sleep(HEART_BEAT_TIMEOUT)
 					}
 				}
 			}(i)
