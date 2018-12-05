@@ -35,6 +35,8 @@ const (
 	REQUEST_VOTE_TIMEOUT = 20 * time.Millisecond
 	HEART_BEAT_TIMEOUT = 50 * time.Millisecond
 	CHECK_LAST_APPLIED_TIMEOUT = 20 * time.Millisecond
+	CHECK_REPLICATION_TIMEOUT = 20 * time.Millisecond
+	CHECK_MAJORITY_VOTE_TIMEOUT = 20 * time.Millisecond
 
     RPC_APPEND_ENTRIES = "Raft.AppendEntries"
     RPC_REQUEST_VOTE = "Raft.RequestVote"
@@ -104,10 +106,7 @@ type Raft struct {
 	role 			int
 	killed 			bool 				// use to suggest this instance has been killed, only for tests
 	votes 			[]bool
-	fCh				chan interface{}	// use to suggest any valid communication from follower
-	lCh		 		chan interface{} 	// use to suggest any valid communication from leader
-	cCh 			chan interface{} 	// use to suggest any valid communication from candidate
-	aslCh 			chan interface{}    // use to suggest has become leader
+	rCh 			chan interface{} 	// use to suggest new election timeout
 	applyCh 		chan ApplyMsg
 }
 
@@ -218,9 +217,14 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	rf.PDPrintf("receive RequestVote from %d, with term %d", args.CandidateID, args.Term)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	if args.Term < rf.currentTerm {
+		reply.VoteGranted = false
+		reply.Term = rf.currentTerm
+		return
+	}
 
 	var voteGranted bool
 
@@ -236,14 +240,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	if voteGranted {
 		rf.votedFor = args.CandidateID
-		rf.cCh<- struct{}{}
 	}
+
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = voteGranted
 
 	// persist state before responding to RPCs
 	// term, votedFor may have changed
 	rf.persist()
+	rf.rCh<-struct{}{}
 }
 
 //
@@ -323,16 +328,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.Term = rf.currentTerm
 			reply.Success = false
 			rf.persist()
+			rf.rCh<-struct{}{}
 			return
 		}
 	} else {
 		prevIndex = -1
 	}
 
-	// it's a valid message, so start a new election timeout by lCh
 	rf.role = FOLLOWER
-	rf.votedFor = args.LeaderId
-	rf.lCh<-struct{}{}
 
 	// 3. if an existing entry conflicts with a new one(same index
 	// but different terms), delete the existing entry and all that
@@ -346,7 +349,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 5. If leaderCommit > commitIndex, set commitIndex =
 	// min(leaderCommit, index of last new entry)
 	if args.LeaderCommit > rf.commitIndex {
-		le := rf.logs[len(rf.logs)-1]
+		le := rf.lastLogEntry()
 		rf.commitIndex = min(args.LeaderCommit, le.Index)
 	}
 
@@ -356,8 +359,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// persists state before responding to RPCs
 	// term, logs may be changed
 	rf.persist()
-
-	return
+	rf.rCh<-struct{}{}
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -465,15 +467,25 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			rf.PDPrintf("new election timeout: %d", et)
 
 			select {
-			case <-rf.fCh:
-			case <-rf.cCh:
-			case <-rf.lCh:
-			case <-rf.aslCh:
+			case <-rf.rCh:
 			case <-time.After(time.Millisecond * time.Duration(et)): {
 				rf.PDPrintf("begins a new election")
-				rf.beginNewElection()
+				go rf.beginNewElection()
 			}
 			}
+		}
+	}()
+
+	go func() {
+		for {
+			rf.mu.Lock()
+			if rf.role == CANDIDATE && hasMajorityVotes(rf.votes) {
+				rf.PDPrintf("becomes LEADER")
+				rf.role = LEADER
+				rf.initNextIndex()
+			}
+			rf.mu.Unlock()
+			time.Sleep(CHECK_MAJORITY_VOTE_TIMEOUT)
 		}
 	}()
 
@@ -487,7 +499,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			// commitIndex = N
 			// PURPOSE: split checking logic and replication apart
 			rf.mu.Lock()
-			if rf.role == LEADER && len(rf.logs) > 0{
+			if rf.role == LEADER && len(rf.logs) > 0 {
 				for _, le := range rf.logs[rf.commitIndex:] {
 					// Raft paper p9
 					// Raft never commits log entries from previous terms by counting replicas
@@ -501,13 +513,19 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				}
 			}
 			rf.mu.Unlock()
+			time.Sleep(CHECK_REPLICATION_TIMEOUT)
+		}
+	}()
 
+	go func() {
+		for {
 			// if commitIndex > lastApplied: increment lastApplied, apply
 			// log[lastApplied] to state machine
-			rf.PDPrintf("rf.logs %v, rf.term %v, rf.nextIndex %d, rf.commitIndex %d, rf.lastApplied %d",
-				rf.logs, rf.currentTerm, rf.nextIndex, rf.commitIndex, rf.lastApplied)
+			//rf.PDPrintf("rf.logs %v, rf.term %v, rf.nextIndex %d, rf.commitIndex %d, rf.lastApplied %d",
+			//	rf.logs, rf.currentTerm, rf.nextIndex, rf.commitIndex, rf.lastApplied)
 			//rf.PDPrintf("rf.term %v, rf.nextIndex %d, rf.commitIndex %d, rf.lastApplied %d",
 			//	rf.currentTerm, rf.nextIndex, rf.commitIndex, rf.lastApplied)
+			rf.mu.Lock()
 			if rf.commitIndex > rf.lastApplied {
 				le := rf.logs[rf.lastApplied]
 				rf.applyCh<-ApplyMsg{
@@ -517,6 +535,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				}
 				rf.lastApplied += 1
 			}
+			rf.mu.Unlock()
 			time.Sleep(CHECK_LAST_APPLIED_TIMEOUT)
 		}
 	}()
@@ -540,12 +559,7 @@ func (rf *Raft) initServer() {
 	rf.role = FOLLOWER
 	rf.killed = false
 	rf.votes = make([]bool, len(rf.peers))
-	rf.fCh = make(chan interface{})
-	rf.lCh = make(chan interface{})
-	rf.cCh = make(chan interface{})
-	rf.aslCh = make(chan interface{})
-
-
+	rf.rCh = make(chan interface{})
 	// initialize from state persisted before a crash
 	rf.readPersist(rf.persister.ReadRaftState())
 	// initialization ends
@@ -564,8 +578,9 @@ func (rf *Raft) initNextIndex() {
 func (rf *Raft) beginNewElection() {
 	// increase current term
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
+
 	rf.currentTerm += 1
+	rf.votes = make([]bool, len(rf.peers))
 	// votes for itself
 	rf.votedFor = rf.me
 	rf.votes[rf.me] = true
@@ -573,6 +588,8 @@ func (rf *Raft) beginNewElection() {
 	rf.role = CANDIDATE
 	// should persist state because the votedFor and currentTerm has changed
 	rf.persist()
+
+	rf.mu.Unlock()
 	// issues RequestVote RPCs in parallel to each of the other servers
 	for i, _ := range rf.peers {
 		if i != rf.me {
@@ -587,6 +604,7 @@ func (rf *Raft) issueRequestVote(server int) {
 	// Raft uses the voting process to prevent a candidate from winning an election
 	// unless its log contains all committed entries. So RequestVoteArgs should take
 	// information about the candidate's logs
+	rf.mu.Lock()
 	ll := rf.lastLogEntry()
 
 	args := RequestVoteArgs{
@@ -595,6 +613,7 @@ func (rf *Raft) issueRequestVote(server int) {
 		LastLogIndex: ll.Index,
 		LastLogTerm:  ll.Term,
 	}
+	rf.mu.Unlock()
 
 	// retry if request failed
 	for {
@@ -603,23 +622,18 @@ func (rf *Raft) issueRequestVote(server int) {
 		ok := rf.sendRequestVote(server, &args, &reply)
 
 		if ok {
-			rf.mu.Lock()
 			rf.PDPrintf("request vote reply %v", reply)
-			if rf.checkTerm(reply.Term) {
-				if rf.role == CANDIDATE && reply.VoteGranted {
-					rf.PDPrintf("receive vote from %d", server)
-					rf.votes[server] = true
-					if hasMajorityVotes(rf.votes) {
-						rf.PDPrintf("becomes LEADER")
-						// gain majority votes: becomes LEADER
-						rf.role = LEADER
-						rf.votes = make([]bool, len(rf.peers))
-						rf.initNextIndex()
-						rf.aslCh<-struct{}{}
-					}
-				}
+
+			rf.mu.Lock()
+			if args.Term == reply.Term && rf.currentTerm == reply.Term && reply.VoteGranted {
+				rf.PDPrintf("receive vote from %d", server)
+				rf.votes[server] = true
+			} else {
+				rf.checkTerm(reply.Term)
 			}
 			rf.mu.Unlock()
+
+			rf.rCh<-struct{}{}
 			return
 		} else {
 			time.Sleep(REQUEST_VOTE_TIMEOUT)
@@ -639,6 +653,8 @@ func (rf *Raft) sendAppendEntriesMessages() {
 					}
 
 					shouldSleep := true
+
+					rf.mu.Lock()
 					// the rf node will continue sending append entries to other nodes
 					// different peers can receive different entries
 					ple := rf.prevLogEntry(server)
@@ -652,6 +668,7 @@ func (rf *Raft) sendAppendEntriesMessages() {
 						Entries:      entries,
 						LeaderCommit: rf.commitIndex,
 					}
+					rf.mu.Unlock()
 
 					reply := AppendEntriesReply{}
 					//rf.PDPrintf("sends AppendEntries to %d, with entries %v", server, entries)
@@ -659,27 +676,28 @@ func (rf *Raft) sendAppendEntriesMessages() {
 					ok := rf.sendAppendEntries(server, &args, &reply)
 					if ok {
 						rf.mu.Lock()
-						isTermValid := rf.checkTerm(reply.Term)
-						if !reply.Success {
-							if isTermValid {
+						if args.Term == reply.Term && rf.currentTerm == reply.Term {
+							if reply.Success {
+								//rf.PDPrintf("entries %v replicated to %d", entries, server)
+								rf.PDPrintf("entries length %d replicated to %d", len(entries), server)
+								// when safely replicated, the leader applies the
+								// entry to its state machine and returns the result
+								// of that execution to the client
+								if rf.nextIndex[server] < lle.Index+1 {
+									rf.nextIndex[server] = lle.Index+1
+								}
+								if rf.matchIndex[server] < lle.Index {
+									rf.matchIndex[server] = lle.Index
+								}
+							} else {
 								rf.nextIndex[server] -= 1
 								shouldSleep = false
 							}
 						} else {
-							//rf.PDPrintf("entries %v replicated to %d", entries, server)
-							rf.PDPrintf("entries length %d replicated to %d", len(entries), server)
-							// when safely replicated, the leader applies the
-							// entry to its state machine and returns the result
-							// of that execution to the client
-							if rf.nextIndex[server] < lle.Index+1 {
-								rf.nextIndex[server] = lle.Index+1
-							}
-							if rf.matchIndex[server] < lle.Index {
-								rf.matchIndex[server] = lle.Index
-							}
+							rf.checkTerm(reply.Term)
 						}
 						rf.mu.Unlock()
-						rf.fCh<-struct{}{}
+						rf.rCh<-struct{}{}
 					}
 
 					if shouldSleep {
