@@ -838,7 +838,7 @@ func (rf *Raft) appendNewEntries(entries []logEntry, prevIndex int) {
 }
 
 func generateET() int {
-	return rand.Intn(ELECTION_TIMEOUT_LB) + (ELECTION_TIMEOUT_UB - ELECTION_TIMEOUT_LB)
+	return ELECTION_TIMEOUT_LB + rand.Intn(ELECTION_TIMEOUT_UB - ELECTION_TIMEOUT_LB)
 }
 
 func hasMajorityVotes(votes []bool) bool {
