@@ -236,6 +236,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		voteGranted = rf.checkVoteConsistency(args)
 		rf.currentTerm = args.Term
 		rf.role = FOLLOWER
+		rf.votedFor = NOBODY
 	}
 
 	if voteGranted {
@@ -320,6 +321,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 2. Reply false if log doesn't contain an entry at prevLogIndex
 	// whose term matches prevLogTerm. (Consistency Check)
+	rf.PDPrintf("logs: %v, args: %v\n", rf.logs, args)
 	var prevIndex int
 	var found bool
 	if args.PrevLogIndex > 0 {
@@ -336,6 +338,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	rf.role = FOLLOWER
+	rf.votedFor = NOBODY
 
 	// 3. if an existing entry conflicts with a new one(same index
 	// but different terms), delete the existing entry and all that
@@ -557,6 +560,7 @@ func (rf *Raft) initServer() {
 	// raft p5 5.2
 	// When servers start up, they begin as followers.
 	rf.role = FOLLOWER
+	rf.votedFor = NOBODY
 	rf.killed = false
 	rf.votes = make([]bool, len(rf.peers))
 	rf.rCh = make(chan interface{})
@@ -618,15 +622,15 @@ func (rf *Raft) issueRequestVote(server int) {
 	// retry if request failed
 	for {
 		reply := RequestVoteReply{}
-		rf.PDPrintf("sends RequestVote to %d", server)
+		//rf.PDPrintf("sends RequestVote to %d", server)
 		ok := rf.sendRequestVote(server, &args, &reply)
 
 		if ok {
-			rf.PDPrintf("request vote reply %v", reply)
+			//rf.PDPrintf("request vote reply %v", reply)
 
 			rf.mu.Lock()
 			if args.Term == reply.Term && rf.currentTerm == reply.Term && reply.VoteGranted {
-				rf.PDPrintf("receive vote from %d", server)
+				//rf.PDPrintf("receive vote from %d", server)
 				rf.votes[server] = true
 			} else {
 				rf.checkTerm(reply.Term)
@@ -764,15 +768,19 @@ func (rf *Raft) checkVoteConsistency(args *RequestVoteArgs) bool {
 	// is more up-to-date. If the logs end with the same term, then whichever
 	// log is longer is more up-to-date
 	var voteGranted bool
-	if len(rf.logs) > 0 && args.LastLogIndex > 0 {
-		ll := rf.lastLogEntry()
-		rf.PDPrintf("args %v, last log entry: %v\n", args, ll)
-		if args.LastLogTerm > ll.Term {
-			voteGranted = true
-		}
+	if len(rf.logs) > 0 {
+		if args.LastLogIndex > 0 {
+			ll := rf.lastLogEntry()
+			rf.PDPrintf("args %v, last log entry: %v\n", args, ll)
+			if args.LastLogTerm > ll.Term {
+				voteGranted = true
+			}
 
-		if args.LastLogTerm == ll.Term && args.LastLogIndex >= ll.Index {
-			voteGranted = true
+			if args.LastLogTerm == ll.Term && args.LastLogIndex >= ll.Index {
+				voteGranted = true
+			}
+		} else {
+			voteGranted = false
 		}
 	} else {
 		voteGranted = true
@@ -877,7 +885,8 @@ func (rf *Raft) PDPrintf(format string, a ...interface{}) (n int, err error) {
 	case LEADER:
 		roleString = "L"
 	}
-	head := fmt.Sprintf("[Term %d Role %s Peer %d]: ", rf.currentTerm, roleString, rf.me)
+	head := fmt.Sprintf("[Term %d Role %s LL %d CI %d Peer %d]: ",
+		rf.currentTerm, roleString, len(rf.logs), rf.commitIndex, rf.me)
 	DPrintf(head + format, a...)
 	return
 }
