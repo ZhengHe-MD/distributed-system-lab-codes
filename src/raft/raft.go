@@ -317,6 +317,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// recognizes the leader as legitimate and returns to follower state
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
+		rf.role = FOLLOWER
+		rf.votedFor = NOBODY
 	}
 
 	// 2. Reply false if log doesn't contain an entry at prevLogIndex
@@ -336,9 +338,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	} else {
 		prevIndex = -1
 	}
-
-	rf.role = FOLLOWER
-	rf.votedFor = NOBODY
 
 	// 3. if an existing entry conflicts with a new one(same index
 	// but different terms), delete the existing entry and all that
@@ -622,15 +621,15 @@ func (rf *Raft) issueRequestVote(server int) {
 	// retry if request failed
 	for {
 		reply := RequestVoteReply{}
-		//rf.PDPrintf("sends RequestVote to %d", server)
+		rf.PDPrintf("sends RequestVote to %d", server)
 		ok := rf.sendRequestVote(server, &args, &reply)
 
 		if ok {
-			//rf.PDPrintf("request vote reply %v", reply)
+			rf.PDPrintf("request vote reply %v", reply)
 
 			rf.mu.Lock()
 			if args.Term == reply.Term && rf.currentTerm == reply.Term && reply.VoteGranted {
-				//rf.PDPrintf("receive vote from %d", server)
+				rf.PDPrintf("receive vote from %d", server)
 				rf.votes[server] = true
 			} else {
 				rf.checkTerm(reply.Term)
