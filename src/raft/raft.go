@@ -32,8 +32,9 @@ const (
 	ELECTION_TIMEOUT_LB = 150
 	ELECTION_TIMEOUT_UB = 300
 
-	REQUEST_VOTE_TIMEOUT = 20 * time.Millisecond
-	HEART_BEAT_TIMEOUT = 50 * time.Millisecond
+	// lower than 40 will trigger too many RPC calls
+	REQUEST_VOTE_TIMEOUT = 40 * time.Millisecond
+	HEART_BEAT_TIMEOUT = 40 * time.Millisecond
 	CHECK_LAST_APPLIED_TIMEOUT = 20 * time.Millisecond
 	CHECK_REPLICATION_TIMEOUT = 20 * time.Millisecond
 	CHECK_MAJORITY_VOTE_TIMEOUT = 20 * time.Millisecond
@@ -422,8 +423,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.persist()
 		return e.Index, rf.currentTerm, true
 	}
-
-	return index, term, isLeader
 }
 
 //
@@ -620,6 +619,9 @@ func (rf *Raft) issueRequestVote(server int) {
 
 	// retry if request failed
 	for {
+		if rf.role != CANDIDATE || rf.currentTerm != args.Term {
+			return
+		}
 		reply := RequestVoteReply{}
 		rf.PDPrintf("sends RequestVote to %d", server)
 		ok := rf.sendRequestVote(server, &args, &reply)
@@ -655,8 +657,6 @@ func (rf *Raft) sendAppendEntriesMessages() {
 						continue
 					}
 
-					shouldSleep := true
-
 					rf.mu.Lock()
 					// the rf node will continue sending append entries to other nodes
 					// different peers can receive different entries
@@ -676,36 +676,36 @@ func (rf *Raft) sendAppendEntriesMessages() {
 					reply := AppendEntriesReply{}
 					//rf.PDPrintf("sends AppendEntries to %d, with entries %v", server, entries)
 					rf.PDPrintf("sends AppendEntries to %d, with entries length %d", server, len(entries))
-					ok := rf.sendAppendEntries(server, &args, &reply)
-					if ok {
-						rf.mu.Lock()
-						if args.Term == reply.Term && rf.currentTerm == reply.Term {
-							if reply.Success {
-								//rf.PDPrintf("entries %v replicated to %d", entries, server)
-								rf.PDPrintf("entries length %d replicated to %d", len(entries), server)
-								// when safely replicated, the leader applies the
-								// entry to its state machine and returns the result
-								// of that execution to the client
-								if rf.nextIndex[server] < lle.Index+1 {
-									rf.nextIndex[server] = lle.Index+1
-								}
-								if rf.matchIndex[server] < lle.Index {
-									rf.matchIndex[server] = lle.Index
+					go func() {
+						ok := rf.sendAppendEntries(server, &args, &reply)
+						if ok {
+							rf.mu.Lock()
+							if args.Term == reply.Term && rf.currentTerm == reply.Term {
+								if reply.Success {
+									//rf.PDPrintf("entries %v replicated to %d", entries, server)
+									rf.PDPrintf("entries length %d replicated to %d", len(entries), server)
+									// when safely replicated, the leader applies the
+									// entry to its state machine and returns the result
+									// of that execution to the client
+									if rf.nextIndex[server] < lle.Index+1 {
+										rf.nextIndex[server] = lle.Index+1
+									}
+									if rf.matchIndex[server] < lle.Index {
+										rf.matchIndex[server] = lle.Index
+									}
+								} else {
+									if rf.nextIndex[server] == ple.Index + 1 {
+										rf.nextIndex[server] = 1
+									}
 								}
 							} else {
-								rf.nextIndex[server] -= 1
-								shouldSleep = false
+								rf.checkTerm(reply.Term)
 							}
-						} else {
-							rf.checkTerm(reply.Term)
+							rf.mu.Unlock()
+							rf.rCh<-struct{}{}
 						}
-						rf.mu.Unlock()
-						rf.rCh<-struct{}{}
-					}
-
-					if shouldSleep {
-						time.Sleep(HEART_BEAT_TIMEOUT)
-					}
+					}()
+					time.Sleep(HEART_BEAT_TIMEOUT)
 				}
 			}(i)
 		}
