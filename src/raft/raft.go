@@ -457,7 +457,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 			select {
 			case <-rf.rCh:
-			case <-time.After(time.Millisecond * time.Duration(et)): {
+			case <-time.After(et): {
 				rf.PDPrintf("starts a new election")
 				go rf.startsNewElection()
 			}
@@ -833,8 +833,9 @@ func (rf *Raft) appendNewEntries(entries []logEntry, prevIndex int) {
 }
 
 // generate election timeout
-func generateET() int {
-	return ElectionTimeoutLb + rand.Intn(ElectionTimeoutUb - ElectionTimeoutLb)
+func generateET() time.Duration {
+	timeout := ElectionTimeoutLb + rand.Intn(ElectionTimeoutUb - ElectionTimeoutLb)
+	return time.Millisecond * time.Duration(timeout)
 }
 
 func hasMajorityVotes(votes []bool) bool {
